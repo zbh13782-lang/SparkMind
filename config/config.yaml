@@ -1,0 +1,4 @@
+api:
+  base_url: "http://localhost:20128/v1"
+  api_key: "sk-54027ea1b7cab6a1-9yi909-90d259c0"
+  model: "yuanshennb"

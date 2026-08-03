@@ -1,0 +1,16 @@
+[project]
+name = "sparkmind"
+version = "0.1.0"
+description = "AI 数据助手 CLI"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "openai>=1.0",
+    "textual>=0.80",
+    "pyyaml",
+    "ruff>=0.16.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sparkos*"]
