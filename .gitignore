@@ -27,4 +27,4 @@ logs/
 *.log.*
 .ruff_cache/
 sparkmind.egg-info/
-skills/
+.claude/
