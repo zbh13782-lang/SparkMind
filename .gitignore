@@ -28,3 +28,4 @@ logs/
 .ruff_cache/
 sparkmind.egg-info/
 .claude/
+.sparkmind/

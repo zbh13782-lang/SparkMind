@@ -1,53 +1,13 @@
-"""OpenAI API 封装：流式文本 + 工具调用循环。"""
+"""LLM 客户端：流式文本 + 工具调用循环。"""
 
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from typing import Any
 
 from openai import AsyncOpenAI
 
-
-@dataclass
-class ChatMessage:
-    role: str
-    content: str
-
-
-@dataclass
-class ToolCall:
-    """工具调用信息。"""
-    call_id: str
-    name: str
-    arguments: str
-    result: str = ""
-
-
-@dataclass
-class ChatConfig:
-    base_url: str = "http://localhost:11434/v1"
-    api_key: str = "ollama"
-    model: str = "llama3"
-
-    @classmethod
-    def from_yaml(cls, path: str = "config/config.yaml") -> ChatConfig:
-        """从 config/config.yaml 读取配置，缺失项使用默认值。"""
-        import yaml
-
-        cfg: dict = {}
-        if os.path.exists(path):
-            with open(path) as f:
-                cfg = yaml.safe_load(f) or {}
-
-        api = cfg.get("api", {})
-        return cls(
-            base_url=api.get("base_url", cls.base_url),
-            api_key=api.get("api_key", cls.api_key),
-            model=api.get("model", cls.model),
-        )
+from .models import ChatConfig, ChatMessage, ToolCall
 
 
 class OpenAIChatClient:
@@ -58,8 +18,8 @@ class OpenAIChatClient:
     async def chat_stream(
         self,
         messages: list[ChatMessage],
-        tools: list[dict[str, Any]] | None = None,
-        execute_tool: Any = None,
+        tools: list[dict] | None = None,
+        execute_tool: object = None,
     ) -> AsyncIterator[str | ToolCall]:
         """流式发送消息，支持工具调用循环。
 
@@ -71,8 +31,14 @@ class OpenAIChatClient:
         Yields:
             文本片段（str）或工具调用（ToolCall）
         """
-        api_messages = [{"role": m.role, "content": m.content} for m in messages]
-        kwargs: dict[str, Any] = {
+        api_messages: list[dict] = []
+        for m in messages:
+            msg_dict: dict = {"role": m.role, "content": m.content}
+            if m.tool_calls:
+                msg_dict["tool_calls"] = m.tool_calls
+            api_messages.append(msg_dict)
+
+        kwargs: dict = {
             "model": self.config.model,
             "messages": api_messages,
             "stream": True,
@@ -110,7 +76,9 @@ class OpenAIChatClient:
                         if tc_delta.function.name:
                             tool_calls[tc_delta.id].name = tc_delta.function.name
                         if tc_delta.function.arguments:
-                            tool_calls[tc_delta.id].arguments += tc_delta.function.arguments
+                            tool_calls[
+                                tc_delta.id
+                            ].arguments += tc_delta.function.arguments
 
         # 执行工具调用
         for tc in tool_calls.values():
@@ -130,10 +98,10 @@ class OpenAIChatClient:
 
     async def _follow_up(
         self,
-        messages: list[dict[str, Any]],
+        messages: list[dict],
         full_text: str,
         tool_calls: list[ToolCall],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict] | None,
     ) -> AsyncIterator[str]:
         """将工具结果发送给模型，获取最终回复。"""
         follow_messages = list(messages)
@@ -142,13 +110,15 @@ class OpenAIChatClient:
             follow_messages.append({"role": "assistant", "content": full_text})
 
         for tc in tool_calls:
-            follow_messages.append({
-                "role": "tool",
-                "tool_call_id": tc.call_id,
-                "content": json.dumps({"result": tc.result}),
-            })
+            follow_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.call_id,
+                    "content": json.dumps({"result": tc.result}),
+                }
+            )
 
-        kwargs: dict[str, Any] = {
+        kwargs: dict = {
             "model": self.config.model,
             "messages": follow_messages,
             "stream": True,
@@ -164,3 +134,19 @@ class OpenAIChatClient:
             delta = chunk.choices[0].delta
             if delta.content:
                 yield delta.content
+
+
+async def stream_ai_response(
+    config: ChatConfig,
+    messages: list[ChatMessage],
+    tools: list[dict] | None = None,
+    execute_tool: object = None,
+) -> AsyncIterator[str | ToolCall]:
+    """统一流式接口，封装底层 AI SDK + 工具调用循环。"""
+    client = OpenAIChatClient(config)
+    async for item in client.chat_stream(
+        messages=messages,
+        tools=tools,
+        execute_tool=execute_tool,
+    ):
+        yield item
