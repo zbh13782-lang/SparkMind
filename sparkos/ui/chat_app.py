@@ -308,18 +308,19 @@ class ChatApp(App):
 
     async def _show_tool_call(self, tc: ToolCall, chat: VerticalScroll) -> None:
         """在聊天区显示工具调用信息。"""
-        # 一行摘要 + 可展开详情
-        label = Static(f"[dim]调用工具[/dim] [bold cyan]{tc.name}[/bold cyan]")
         detail = Static(
             f"[bold]参数:[/bold] {tc.arguments[:500]}\n"
             f"[bold]结果:[/bold] {tc.result[:500]}",
             classes="tool-detail",
         )
-        collapsible = Collapsible(
-            label,
-            detail,
+        await chat.mount(
+            Collapsible(
+                detail,
+                title=f"调用工具 [bold cyan]{tc.name}[/bold cyan]",
+                collapsed_symbol="",
+                expanded_symbol="",
+            )
         )
-        await chat.mount(collapsible)
 
     def _serialize_history(self) -> list[dict[str, Any]]:
         """将 _history 序列化为可持久化的 dict 列表。"""

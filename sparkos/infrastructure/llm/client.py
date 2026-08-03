@@ -86,54 +86,93 @@ class OpenAIChatClient:
                 tc.result = execute_tool(tc.name, json.loads(tc.arguments or "{}"))
             yield tc
 
-        # 如果有工具调用，将结果发给模型获取最终回复
+        # 循环处理多轮工具调用
         if tool_calls and execute_tool is not None:
-            async for text in self._follow_up(
+            async for item in self._follow_up_loop(
                 messages=api_messages,
                 full_text=full_text,
                 tool_calls=list(tool_calls.values()),
                 tools=tools,
+                execute_tool=execute_tool,
             ):
-                yield text
+                yield item
 
-    async def _follow_up(
+    async def _follow_up_loop(
         self,
         messages: list[dict],
         full_text: str,
         tool_calls: list[ToolCall],
         tools: list[dict] | None,
-    ) -> AsyncIterator[str]:
-        """将工具结果发送给模型，获取最终回复。"""
-        follow_messages = list(messages)
+        execute_tool: object = None,
+    ) -> AsyncIterator[str | ToolCall]:
+        """将工具结果发送给模型，持续循环直到模型不再调用工具。"""
+        while True:
+            follow_messages = list(messages)
 
-        if full_text:
-            follow_messages.append({"role": "assistant", "content": full_text})
+            if full_text:
+                follow_messages.append({"role": "assistant", "content": full_text})
 
-        for tc in tool_calls:
-            follow_messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.call_id,
-                    "content": json.dumps({"result": tc.result}),
-                }
-            )
+            for tc in tool_calls:
+                follow_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.call_id,
+                        "content": json.dumps({"result": tc.result}),
+                    }
+                )
 
-        kwargs: dict = {
-            "model": self.config.model,
-            "messages": follow_messages,
-            "stream": True,
-        }
-        if tools:
-            kwargs["tools"] = tools
+            kwargs: dict = {
+                "model": self.config.model,
+                "messages": follow_messages,
+                "stream": True,
+            }
+            if tools:
+                kwargs["tools"] = tools
 
-        response = await self.client.chat.completions.create(**kwargs)
+            response = await self.client.chat.completions.create(**kwargs)
 
-        async for chunk in response:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta.content:
-                yield delta.content
+            full_text = ""
+            new_tool_calls: dict[str, ToolCall] = {}
+
+            async for chunk in response:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                if delta.content:
+                    full_text += delta.content
+                    yield delta.content
+
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        if tc_delta.id:
+                            new_tool_calls[tc_delta.id] = ToolCall(
+                                call_id=tc_delta.id,
+                                name="",
+                                arguments="",
+                            )
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                new_tool_calls[tc_delta.id].name = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                new_tool_calls[
+                                    tc_delta.id
+                                ].arguments += tc_delta.function.arguments
+
+            # 本轮没有新工具调用，结束循环
+            if not new_tool_calls:
+                break
+
+            # 执行新工具调用并 yield
+            for tc in new_tool_calls.values():
+                if execute_tool is not None:
+                    tc.result = execute_tool(
+                        tc.name, json.loads(tc.arguments or "{}")
+                    )
+                yield tc
+
+            tool_calls = list(new_tool_calls.values())
+            messages = follow_messages
 
 
 async def stream_ai_response(
