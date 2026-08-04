@@ -3,23 +3,24 @@
 from __future__ import annotations
 
 import traceback
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from textual import work
 from textual.app import App, ComposeResult
 from textual.containers import VerticalScroll
 from textual.widgets import Collapsible, Footer, Header, Input, Markdown, Static
 
-from sparkos.agent.memory import create_session, save_session
-from sparkos.agent.skills.loader import (
-    build_system_message,
-    build_system_messages,
-    load_skills,
-    parse_slash_command,
+from sparkos.agent.events import (
+    PlanCreated,
+    TaskCompleted,
+    TaskFailed,
+    TextDelta,
+    ToolCompleted,
 )
-from sparkos.agent.tools.registry import TOOL_DEFINITIONS, execute_tool
-from sparkos.infrastructure.llm.client import stream_ai_response
-from sparkos.infrastructure.llm.models import ChatConfig, ChatMessage, ToolCall
+from sparkos.agent.runtime import AgentRuntime
+from sparkos.agent.skills.loader import load_skills, parse_slash_command
+from sparkos.agent.task import AgentTask
+from sparkos.infrastructure.llm.models import ToolCall
 from sparkos.ui.file_browser_screen import FileBrowserScreen
 from sparkos.ui.history_screen import HistoryScreen
 
@@ -92,10 +93,8 @@ class ChatApp(App):
 
     def __init__(self) -> None:
         super().__init__()
-        self._history: list[ChatMessage] = []
+        self.runtime = AgentRuntime(enable_planning=True)
         self._generation_worker: object | None = None
-        self._system_message: str = build_system_message(load_skills())
-        self._session_id: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -196,23 +195,12 @@ class ChatApp(App):
         await chat.mount(user_message)
         await chat.mount(assistant_message)
 
-        skills = load_skills()
-        skill_name, prompt_text = parse_slash_command(prompt, skills)
+        skill_name, prompt_text = parse_slash_command(prompt, self.runtime.skills)
 
-        # 传给 API 用干净的消息（去掉 /skill 前缀），UI 显示保留原始输入
-        api_user_msg = ChatMessage(role="user", content=prompt_text or prompt)
-        self._history.append(api_user_msg)
-
-        # 首次对话时创建会话
-        if self._session_id is None:
-            session = create_session(self._serialize_history())
-            self._session_id = session.session_id
-
-        config = ChatConfig.from_yaml()
+        task = AgentTask(goal=prompt_text or prompt)
 
         self._generation_worker = self.generate_answer(
-            config=config,
-            messages=self._api_messages(),
+            task=task,
             skill_name=skill_name,
             output=assistant_message,
         )
@@ -222,8 +210,7 @@ class ChatApp(App):
     @work(exclusive=True, group="ai-generation", exit_on_error=False)
     async def generate_answer(
         self,
-        config: ChatConfig,
-        messages: list[ChatMessage],
+        task: AgentTask,
         skill_name: str | None,
         output: Markdown,
     ) -> None:
@@ -234,52 +221,29 @@ class ChatApp(App):
         prompt_input.disabled = True
         status.update("正在思考……")
 
-        skills = load_skills()
-        system_msgs = build_system_messages(skills, skill_name)
-        api_messages = [
-            ChatMessage(role=sm["role"], content=sm["content"]) for sm in system_msgs
-        ] + list(messages)
-
         markdown_stream = Markdown.get_stream(output)
         received_text = False
-        full_text = ""
-        tool_calls: list[ToolCall] = []
 
         try:
-            async for item in stream_ai_response(
-                config, api_messages, tools=TOOL_DEFINITIONS, execute_tool=execute_tool
-            ):
-                if isinstance(item, str):
+            async for event in self.runtime.run(task, skill_name=skill_name):
+                if isinstance(event, TextDelta):
                     if not received_text:
                         received_text = True
                         status.update("正在生成……")
-                    full_text += item
-                    await markdown_stream.write(item)
-                elif isinstance(item, ToolCall):
-                    tool_calls.append(item)
-                    await self._show_tool_call(item, chat)
-                    status.update(f"工具: {item.name}")
+                    await markdown_stream.write(event.text)
+                elif isinstance(event, ToolCompleted):
+                    await self._show_tool_call(event.tool_call, chat)
+                    status.update(f"工具: {event.tool_call.name}")
+                elif isinstance(event, PlanCreated):
+                    status.update(f"已生成计划（{len(event.plan.steps)} 步）")
+                elif isinstance(event, TaskCompleted):
+                    status.update("生成完成")
+                elif isinstance(event, TaskFailed):
+                    status.update("请求失败")
 
                 distance_to_bottom = chat.max_scroll_y - chat.scroll_y
                 if distance_to_bottom < 3:
                     chat.scroll_end(animate=False)
-
-            assistant_msg = ChatMessage(
-                role="assistant",
-                content=full_text,
-                tool_calls=[
-                    {
-                        "id": tc.call_id,
-                        "type": "function",
-                        "function": {"name": tc.name, "arguments": tc.arguments},
-                    }
-                    for tc in tool_calls
-                ]
-                or None,
-            )
-            self._history.append(assistant_msg)
-            self._save_current_session()
-            status.update("生成完成")
 
         except Exception as exc:
             self.log(f"[red]请求失败:[/red] {type(exc).__name__}: {exc}")
@@ -296,10 +260,6 @@ class ChatApp(App):
             prompt_input.disabled = False
             prompt_input.focus()
 
-    def _api_messages(self) -> list[ChatMessage]:
-        """构造发给 API 的消息列表，只包含 ChatMessage 实例。"""
-        return [m for m in self._history[-12:] if isinstance(m, ChatMessage)]
-
     async def _show_tool_call(self, tc: ToolCall, chat: VerticalScroll) -> None:
         """在聊天区显示工具调用信息。"""
         detail = Static(
@@ -315,22 +275,6 @@ class ChatApp(App):
                 expanded_symbol="",
             )
         )
-
-    def _serialize_history(self) -> list[dict[str, Any]]:
-        """将 _history 序列化为可持久化的 dict 列表。"""
-        messages: list[dict[str, Any]] = []
-        for m in self._history:
-            entry: dict[str, Any] = {"role": m.role, "content": m.content}
-            if m.tool_calls:
-                entry["tool_calls"] = m.tool_calls
-            messages.append(entry)
-        return messages
-
-    def _save_current_session(self) -> None:
-        """保存当前对话到历史文件。"""
-        if self._session_id is None:
-            return
-        save_session(self._session_id, self._serialize_history())
 
     async def _show_skills_list(self) -> None:
         chat = self.query_one("#chat", VerticalScroll)
@@ -353,9 +297,7 @@ class ChatApp(App):
             getattr(worker, "cancel", lambda: None)()
             self._generation_worker = None
 
-        self._save_current_session()
-        self._session_id = None
-        self._history = []
+        self.runtime.context.clear()
         chat = self.query_one("#chat", VerticalScroll)
         await chat.remove_children()
         self._slash_hint.update("")

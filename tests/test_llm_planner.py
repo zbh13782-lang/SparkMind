@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import json
+import unittest
+
+from sparkos.agent.llm_planner import LLMPlanner
+from sparkos.agent.planner import PlanningContext
+from sparkos.agent.task import AgentTask
+from sparkos.infrastructure.llm.models import ChatMessage
+
+
+class FakePlanningModel:
+    def __init__(self, response: str) -> None:
+        self.response = response
+        self.requests: list[list[dict]] = []
+
+    async def chat_once(self, messages: list[dict]) -> str:
+        self.requests.append(messages)
+        return self.response
+
+
+def planning_context() -> PlanningContext:
+    return PlanningContext(
+        session_id="session-1",
+        summary="Earlier the user selected sales.csv.",
+        recent_messages=(ChatMessage(role="user", content="analyze it"),),
+        skill_names=("spark-sql",),
+        tool_names=("read_file", "shell"),
+    )
+
+
+class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_complex_task_returns_dependency_aware_plan(self) -> None:
+        model = FakePlanningModel(
+            json.dumps(
+                {
+                    "should_plan": True,
+                    "steps": [
+                        {
+                            "id": "s1",
+                            "description": "Inspect the input data",
+                            "depends_on": [],
+                        },
+                        {
+                            "id": "s2",
+                            "description": "Write the findings",
+                            "depends_on": ["s1"],
+                        },
+                    ],
+                }
+            )
+        )
+        task = AgentTask(goal="Analyze the data and produce a report")
+
+        plan = await LLMPlanner(model).create_plan(task, planning_context())
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.task_id, task.id)
+        self.assertEqual([step.id for step in plan.steps], ["s1", "s2"])
+        self.assertEqual(plan.steps[1].depends_on, ["s1"])
+
+    async def test_simple_task_returns_none(self) -> None:
+        model = FakePlanningModel('{"should_plan": false, "steps": []}')
+
+        plan = await LLMPlanner(model).create_plan(
+            AgentTask(goal="Say hello"), planning_context()
+        )
+
+        self.assertIsNone(plan)
+
+    async def test_markdown_fenced_json_is_accepted(self) -> None:
+        model = FakePlanningModel(
+            """```json
+{"should_plan": true, "steps": [{"id": "s1", "description": "Inspect", "depends_on": []}]}
+```"""
+        )
+
+        plan = await LLMPlanner(model).create_plan(
+            AgentTask(goal="Inspect the project"), planning_context()
+        )
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.steps[0].description, "Inspect")
+
+    async def test_malformed_json_falls_back_to_direct_execution(self) -> None:
+        model = FakePlanningModel("not json")
+
+        plan = await LLMPlanner(model).create_plan(
+            AgentTask(goal="Do work"), planning_context()
+        )
+
+        self.assertIsNone(plan)
+
+    async def test_unserializable_task_input_falls_back_to_direct_execution(
+        self,
+    ) -> None:
+        model = FakePlanningModel('{"should_plan": false, "steps": []}')
+        task = AgentTask(goal="Do work", input={"value": object()})
+
+        plan = await LLMPlanner(model).create_plan(task, planning_context())
+
+        self.assertIsNone(plan)
+        self.assertEqual(model.requests, [])
+
+    async def test_unknown_dependency_rejects_plan(self) -> None:
+        model = FakePlanningModel(
+            '{"should_plan":true,"steps":['
+            '{"id":"s1","description":"Inspect","depends_on":["missing"]}]}'
+        )
+
+        plan = await LLMPlanner(model).create_plan(
+            AgentTask(goal="Do work"), planning_context()
+        )
+
+        self.assertIsNone(plan)
+
+    async def test_dependency_cycle_rejects_plan(self) -> None:
+        model = FakePlanningModel(
+            '{"should_plan":true,"steps":['
+            '{"id":"s1","description":"One","depends_on":["s2"]},'
+            '{"id":"s2","description":"Two","depends_on":["s1"]}]}'
+        )
+
+        plan = await LLMPlanner(model).create_plan(
+            AgentTask(goal="Do work"), planning_context()
+        )
+
+        self.assertIsNone(plan)
+
+    async def test_duplicate_step_id_rejects_plan(self) -> None:
+        model = FakePlanningModel(
+            '{"should_plan":true,"steps":['
+            '{"id":"s1","description":"One","depends_on":[]},'
+            '{"id":"s1","description":"Two","depends_on":[]}]}'
+        )
+
+        plan = await LLMPlanner(model).create_plan(
+            AgentTask(goal="Do work"), planning_context()
+        )
+
+        self.assertIsNone(plan)
+
+    async def test_self_dependency_rejects_plan(self) -> None:
+        model = FakePlanningModel(
+            '{"should_plan":true,"steps":['
+            '{"id":"s1","description":"One","depends_on":["s1"]}]}'
+        )
+
+        plan = await LLMPlanner(model).create_plan(
+            AgentTask(goal="Do work"), planning_context()
+        )
+
+        self.assertIsNone(plan)
+
+    async def test_plan_over_configured_step_limit_is_rejected(self) -> None:
+        steps = [
+            {"id": f"s{index}", "description": str(index), "depends_on": []}
+            for index in range(3)
+        ]
+        model = FakePlanningModel(json.dumps({"should_plan": True, "steps": steps}))
+
+        plan = await LLMPlanner(model, max_steps=2).create_plan(
+            AgentTask(goal="Do work"), planning_context()
+        )
+
+        self.assertIsNone(plan)
+
+    async def test_prompt_uses_configured_step_limit(self) -> None:
+        model = FakePlanningModel('{"should_plan": false, "steps": []}')
+
+        await LLMPlanner(model, max_steps=2).create_plan(
+            AgentTask(goal="Do work"), planning_context()
+        )
+
+        self.assertIn("最多 2 步", model.requests[0][0]["content"])
+
+    async def test_empty_step_description_rejects_plan(self) -> None:
+        model = FakePlanningModel(
+            '{"should_plan":true,"steps":['
+            '{"id":"s1","description":"  ","depends_on":[]}]}'
+        )
+
+        plan = await LLMPlanner(model).create_plan(
+            AgentTask(goal="Do work"), planning_context()
+        )
+
+        self.assertIsNone(plan)
+
+    async def test_planning_request_contains_task_context_and_capabilities(
+        self,
+    ) -> None:
+        model = FakePlanningModel('{"should_plan": false, "steps": []}')
+        task = AgentTask(goal="Analyze sales", input={"format": "csv"})
+
+        await LLMPlanner(model).create_plan(task, planning_context())
+
+        self.assertEqual(len(model.requests), 1)
+        payload = json.loads(model.requests[0][1]["content"])
+        self.assertEqual(payload["goal"], "Analyze sales")
+        self.assertEqual(payload["input"], {"format": "csv"})
+        self.assertIn("sales.csv", payload["summary"])
+        self.assertEqual(payload["skills"], ["spark-sql"])
+        self.assertEqual(payload["tools"], ["read_file", "shell"])
+        self.assertEqual(payload["recent_messages"][0]["content"], "analyze it")
+
+
+if __name__ == "__main__":
+    unittest.main()

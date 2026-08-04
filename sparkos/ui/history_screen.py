@@ -9,8 +9,7 @@ from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Markdown, Static
 
-from sparkos.agent.memory import list_sessions, load_session
-from sparkos.infrastructure.llm.models import ChatMessage
+from sparkos.agent.memory import list_sessions
 
 
 class HistoryScreen(Screen):
@@ -66,28 +65,18 @@ class HistoryScreen(Screen):
             await self._load_session(session_id)
 
     async def _load_session(self, session_id: str) -> None:
-        session = load_session(session_id)
-        if session:
-            app = self.app
-            app._session_id = session.session_id
-            app._history = [
-                ChatMessage(
-                    role=m["role"],
-                    content=m["content"],
-                    tool_calls=m.get("tool_calls"),
-                )
-                if isinstance(m, dict)
-                else m
-                for m in session.messages
-            ]
+        app = self.app
+        if app.runtime.context.load_session(session_id):
             chat = app.query_one("#chat", VerticalScroll)
             await chat.remove_children()
             app._slash_hint.update("")
-            for msg in app._history:
+            for msg in app.runtime.context.history:
                 if msg.role == "user":
                     widget = Static(f"你：{msg.content}", classes="user-message")
-                else:
+                elif msg.role == "assistant" and msg.content:
                     widget = Markdown(msg.content, classes="assistant-message")
+                else:
+                    continue
                 chat.mount(widget)
             chat.scroll_end(animate=False)
         self.dismiss()
