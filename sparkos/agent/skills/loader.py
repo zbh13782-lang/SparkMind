@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,6 +46,38 @@ def build_system_message(skills: list[Skill]) -> str:
     lines.append("")
     lines.append("根据用户需求，你可以引用上述技能来回答问题。")
     return "\n".join(lines)
+
+
+def build_system_messages(
+    skills: list[Skill],
+    skill_name: str | None = None,
+    skills_dir: str = "sparkos/agent/skills",
+) -> list[dict]:
+    """构造 API 请求所需的 system message 列表。
+
+    包含：
+    1. 全局 skill 列表（始终）
+    2. 激活技能的 SKILL.md 全文（skill_name 非 None 时）
+
+    Returns:
+        list[dict]，每个元素是 {"role": "system", "content": ...}
+    """
+    messages: list[dict] = []
+    global_msg = build_system_message(skills)
+    if global_msg:
+        messages.append({"role": "system", "content": global_msg})
+
+    if skill_name:
+        content = load_skill_content(skill_name, skills_dir)
+        if content:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": f"当前激活技能：{skill_name}\n\n{content}",
+                }
+            )
+
+    return messages
 
 
 def load_skill_content(
@@ -112,8 +143,12 @@ def _parse_description(path: Path) -> str:
         if end != -1:
             try:
                 frontmatter = yaml.safe_load(raw[3:end]) or {}
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return ""
-            return frontmatter.get("description", "").strip() if isinstance(frontmatter, dict) else ""
+            return (
+                frontmatter.get("description", "").strip()
+                if isinstance(frontmatter, dict)
+                else ""
+            )
 
     return ""

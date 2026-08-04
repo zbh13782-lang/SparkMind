@@ -1,0 +1,62 @@
+services:
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: sparkos-spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    volumes:
+      - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
+
+  spark-worker:
+    image: apache/spark:3.5.3
+    container_name: sparkos-spark-worker
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.worker.Worker
+      - spark://spark-master:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "2g"
+    depends_on:
+      - spark-master
+    ports:
+      - "8081:8081"
+    volumes:
+      - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
+
+  spark-history:
+    image: apache/spark:3.5.3
+    container_name: sparkos-spark-history
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.history.HistoryServer
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_HISTORY_OPTS: "-Dspark.history.fs.logDirectory=file:${SPARKOS_REPO_ROOT:-/opt/sparkos}/artifacts/spark-events"
+    depends_on:
+      - spark-master
+    ports:
+      - "18080:18080"
+    volumes:
+      - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
+
+  hive:
+    image: apache/hive:4.1.0
+    container_name: sparkos-hive
+    environment:
+      SERVICE_NAME: hiveserver2
+      IS_RESUME: "true"
+      HIVE_SERVER2_THRIFT_PORT: "10000"
+    ports:
+      - "10000:10000"
+      - "10002:10002"
+    volumes:
+      - hive-warehouse:/opt/hive/data/warehouse
+
+volumes:
+  hive-warehouse:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -133,6 +132,7 @@ def _shell(command: str) -> str:
             text=True,
             timeout=30,
             cwd=os.getcwd(),
+            check=False,
         )
         output = result.stdout or result.stderr
         if not output:
@@ -140,7 +140,7 @@ def _shell(command: str) -> str:
         return f"退出码: {result.returncode}\n{output}"
     except subprocess.TimeoutExpired:
         return "命令执行超时（30 秒）"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"执行错误: {e}"
 
 
@@ -152,5 +152,5 @@ def _web_fetch(url: str) -> str:
             resp.raise_for_status()
             text = resp.text
             return f"网页内容 ({url}, {len(text)} 字符):\n{text[:5000]}"
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"获取失败: {e}"

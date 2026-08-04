@@ -153,7 +153,9 @@ class OpenAIChatClient:
                             )
                         if tc_delta.function:
                             if tc_delta.function.name:
-                                new_tool_calls[tc_delta.id].name = tc_delta.function.name
+                                new_tool_calls[
+                                    tc_delta.id
+                                ].name = tc_delta.function.name
                             if tc_delta.function.arguments:
                                 new_tool_calls[
                                     tc_delta.id
@@ -166,9 +168,7 @@ class OpenAIChatClient:
             # 执行新工具调用并 yield
             for tc in new_tool_calls.values():
                 if execute_tool is not None:
-                    tc.result = execute_tool(
-                        tc.name, json.loads(tc.arguments or "{}")
-                    )
+                    tc.result = execute_tool(tc.name, json.loads(tc.arguments or "{}"))
                 yield tc
 
             tool_calls = list(new_tool_calls.values())

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from typing import Any, ClassVar
 
 from textual import work
@@ -12,12 +13,14 @@ from textual.widgets import Collapsible, Footer, Header, Input, Markdown, Static
 from sparkos.agent.memory import create_session, save_session
 from sparkos.agent.skills.loader import (
     build_system_message,
+    build_system_messages,
     load_skills,
     parse_slash_command,
 )
 from sparkos.agent.tools.registry import TOOL_DEFINITIONS, execute_tool
 from sparkos.infrastructure.llm.client import stream_ai_response
 from sparkos.infrastructure.llm.models import ChatConfig, ChatMessage, ToolCall
+from sparkos.ui.file_browser_screen import FileBrowserScreen
 from sparkos.ui.history_screen import HistoryScreen
 
 
@@ -64,7 +67,6 @@ class ChatApp(App):
 
     #history-list Button {
         width: 1fr;
-        text-align: left;
         border: none;
     }
 
@@ -103,7 +105,7 @@ class ChatApp(App):
 
         yield Static("就绪", id="status")
         yield Input(
-            placeholder="今天想聊点什么……",
+            placeholder="今天想聊点什么……(输入/ 以显示指令)",
             id="prompt",
         )
         self._slash_hint = Static("", id="slash-hint", classes="slash-hint")
@@ -129,18 +131,21 @@ class ChatApp(App):
             ("/choice", "选择历史会话"),
             ("/history", "查看历史会话列表"),
             ("/clear", "清除当前对话"),
+            ("/select", "选择文件"),
         ]
 
         # 匹配内置命令
         matched_builtin = [
-            (cmd, desc) for cmd, desc in builtin_commands
+            (cmd, desc)
+            for cmd, desc in builtin_commands
             if cmd[1:].casefold().startswith(prefix)
         ]
 
         # 匹配 skill
         skills = load_skills()
         matched_skills = [
-            (f"/{s.name}", s.description) for s in skills
+            (f"/{s.name}", s.description)
+            for s in skills
             if s.name.casefold().startswith(prefix)
         ]
 
@@ -148,8 +153,7 @@ class ChatApp(App):
 
         if all_matches:
             lines = [
-                f"[bold cyan]{cmd}[/bold cyan] — {desc}"
-                for cmd, desc in all_matches
+                f"[bold cyan]{cmd}[/bold cyan] — {desc}" for cmd, desc in all_matches
             ]
             self._slash_hint.update("\n".join(lines))
         else:
@@ -174,6 +178,11 @@ class ChatApp(App):
 
         if prompt in ("/history", "/choice"):
             await self._show_history()
+            self._slash_hint.update("")
+            return
+
+        if prompt == "/select":
+            await self._show_file_browser()
             self._slash_hint.update("")
             return
 
@@ -225,25 +234,11 @@ class ChatApp(App):
         prompt_input.disabled = True
         status.update("正在思考……")
 
-        api_messages: list[ChatMessage] = list(messages)
-        if self._system_message:
-            api_messages.insert(
-                0, ChatMessage(role="system", content=self._system_message)
-            )
-
-        if skill_name:
-            from pathlib import Path
-
-            skill_path = Path("sparkos/agent/skills") / skill_name / "SKILL.md"
-            if skill_path.is_file():
-                content = skill_path.read_text(encoding="utf-8")
-                api_messages.insert(
-                    1,
-                    ChatMessage(
-                        role="system",
-                        content=f"当前激活技能：{skill_name}\n\n{content}",
-                    ),
-                )
+        skills = load_skills()
+        system_msgs = build_system_messages(skills, skill_name)
+        api_messages = [
+            ChatMessage(role=sm["role"], content=sm["content"]) for sm in system_msgs
+        ] + list(messages)
 
         markdown_stream = Markdown.get_stream(output)
         received_text = False
@@ -288,7 +283,6 @@ class ChatApp(App):
 
         except Exception as exc:
             self.log(f"[red]请求失败:[/red] {type(exc).__name__}: {exc}")
-            import traceback
             traceback.print_exc()
             await markdown_stream.write(
                 f"\n\n**请求失败：** `{type(exc).__name__}`: {exc}\n\n"
@@ -369,6 +363,16 @@ class ChatApp(App):
     async def _show_history(self) -> None:
         """显示历史会话选择界面。"""
         self.push_screen(HistoryScreen())
+
+    async def _show_file_browser(self) -> None:
+        """弹出文件选择界面，选中文件后填入输入框供用户继续编辑。"""
+
+        def _on_select(path: str) -> None:
+            prompt_input = self.query_one("#prompt", Input)
+            prompt_input.value = f"选择文件：{path}，"
+            prompt_input.focus()
+
+        self.push_screen(FileBrowserScreen(), _on_select)
 
 
 if __name__ == "__main__":

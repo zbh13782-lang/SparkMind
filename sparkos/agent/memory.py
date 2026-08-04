@@ -30,12 +30,14 @@ def list_sessions() -> list[Session]:
     for f in sorted(HISTORY_DIR.glob("*.json"), reverse=True):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
-            sessions.append(Session(
-                session_id=f.stem,
-                messages=data.get("messages", []),
-                created_at=data.get("created_at", ""),
-            ))
-        except (json.JSONDecodeError, KeyError):
+            sessions.append(
+                Session(
+                    session_id=f.stem,
+                    messages=data.get("messages", []),
+                    created_at=data.get("created_at", ""),
+                )
+            )
+        except json.JSONDecodeError, KeyError:
             continue
     return sessions
 
@@ -52,7 +54,7 @@ def load_session(session_id: str) -> Session | None:
             messages=data.get("messages", []),
             created_at=data.get("created_at", ""),
         )
-    except (json.JSONDecodeError, KeyError):
+    except json.JSONDecodeError, KeyError:
         return None
 
 
@@ -64,11 +66,11 @@ def save_session(session_id: str, messages: list[dict[str, Any]]) -> None:
     if path.is_file():
         try:
             existing = json.loads(path.read_text(encoding="utf-8"))
-            created_at = existing.get("created_at", datetime.now().isoformat())
-        except (json.JSONDecodeError, KeyError):
-            created_at = datetime.now().isoformat()
+            created_at = existing.get("created_at", datetime.now().isoformat())  # noqa: DTZ005
+        except json.JSONDecodeError, KeyError:
+            created_at = datetime.now().isoformat()  # noqa: DTZ005
     else:
-        created_at = datetime.now().isoformat()
+        created_at = datetime.now().isoformat()  # noqa: DTZ005
 
     path.write_text(
         json.dumps(
@@ -82,12 +84,12 @@ def save_session(session_id: str, messages: list[dict[str, Any]]) -> None:
 
 def create_session(messages: list[dict[str, Any]]) -> Session:
     """创建新会话并保存。"""
-    session_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:6]}"
+    session_id = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{uuid.uuid4().hex[:6]}"  # noqa: DTZ005
     save_session(session_id, messages)
     return Session(
         session_id=session_id,
         messages=messages,
-        created_at=datetime.now().isoformat(),
+        created_at=datetime.now().isoformat(),  # noqa: DTZ005
     )
 
 

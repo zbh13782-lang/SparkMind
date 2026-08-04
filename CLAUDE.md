@@ -45,3 +45,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `/skills` 列出所有 skill，`/choice` 进入历史会话选择界面，`/clear` 清除对话
 - 历史会话懒创建：首次发消息时 `create_session()`，每轮结束 `save_session()`
 - `slash-hint` 通过 `self._slash_hint` 实例引用操作，不用 `query_one` 查 ID（避免 `_load_session` 后 widget 失效）
+
+## work principle
+
+- 每次修改完成Py代码之后，使用ruff检查并format。
+- 使用中文回复用户消息。
