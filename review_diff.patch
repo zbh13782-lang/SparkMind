@@ -1,0 +1,4315 @@
+diff --git a/sparkos/agent/context.py b/sparkos/agent/context.py
+index b19db43..96d5f4a 100644
+--- a/sparkos/agent/context.py
++++ b/sparkos/agent/context.py
+@@ -12,6 +12,7 @@ from sparkos.infrastructure.llm.models import ChatMessage
+ 
+ _SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
+ 
++# 最多可见短期窗口数
+ WINDOW = 12
+ 
+ _COMPACT_PROMPT = """你是一个对话记忆压缩器。下面是某段对话的早期内容，以及（可能存在的）之前已压缩的摘要。
+diff --git a/sparkos/agent/events.py b/sparkos/agent/events.py
+index 93de261..a78c144 100644
+--- a/sparkos/agent/events.py
++++ b/sparkos/agent/events.py
+@@ -4,7 +4,8 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ 
+-from sparkos.agent.planner import Plan
++from sparkos.agent.planner import Plan, PlanStep
++from sparkos.agent.step import StepResult, StepVerification
+ from sparkos.agent.task import AgentTask
+ from sparkos.infrastructure.llm.models import ToolCall
+ 
+@@ -19,6 +20,13 @@ class PlanCreated:
+     plan: Plan
+ 
+ 
++@dataclass(frozen=True)
++class PlanReplanned:
++    previous_plan: Plan
++    plan: Plan
++    reason: str
++
++
+ @dataclass(frozen=True)
+ class TextDelta:
+     text: str
+@@ -29,6 +37,42 @@ class ToolCompleted:
+     tool_call: ToolCall
+ 
+ 
++@dataclass(frozen=True)
++class StepStarted:
++    step: PlanStep
++
++
++@dataclass(frozen=True)
++class StepToolCompleted:
++    step: PlanStep
++    tool_call: ToolCall
++
++
++@dataclass(frozen=True)
++class StepCompleted:
++    step: PlanStep
++    result: StepResult
++
++
++@dataclass(frozen=True)
++class StepVerificationCompleted:
++    step: PlanStep
++    verification: StepVerification
++
++
++@dataclass(frozen=True)
++class StepRetrying:
++    step: PlanStep
++    attempt: int
++    reason: str
++
++
++@dataclass(frozen=True)
++class StepFailed:
++    step: PlanStep
++    error: str
++
++
+ @dataclass(frozen=True)
+ class TaskCompleted:
+     task: AgentTask
+@@ -40,13 +84,32 @@ class TaskFailed:
+ 
+ 
+ type AgentEvent = (
+-    TaskStarted | PlanCreated | TextDelta | ToolCompleted | TaskCompleted | TaskFailed
++    TaskStarted
++    | PlanCreated
++    | PlanReplanned
++    | StepStarted
++    | StepToolCompleted
++    | StepVerificationCompleted
++    | StepRetrying
++    | StepCompleted
++    | StepFailed
++    | TextDelta
++    | ToolCompleted
++    | TaskCompleted
++    | TaskFailed
+ )
+ 
+ 
+ __all__ = [
+     "AgentEvent",
+     "PlanCreated",
++    "PlanReplanned",
++    "StepCompleted",
++    "StepFailed",
++    "StepRetrying",
++    "StepStarted",
++    "StepToolCompleted",
++    "StepVerificationCompleted",
+     "TaskCompleted",
+     "TaskFailed",
+     "TaskStarted",
+diff --git a/sparkos/agent/llm_planner.py b/sparkos/agent/llm_planner.py
+index 480e7f2..1cb48a1 100644
+--- a/sparkos/agent/llm_planner.py
++++ b/sparkos/agent/llm_planner.py
+@@ -6,6 +6,7 @@ import json
+ from typing import Any, Protocol
+ 
+ from sparkos.agent.planner import Plan, Planner, PlanningContext, PlanStep
++from sparkos.agent.step import StepResult, StepRun, StepVerification
+ from sparkos.agent.task import AgentTask
+ 
+ _PLANNER_PROMPT_TEMPLATE = """你是 Agent 的任务规划器。你的职责仅是判断任务是否需要多步规划，并在需要时给出最小、可执行的依赖图；不要执行任务。
+@@ -14,7 +15,12 @@ _PLANNER_PROMPT_TEMPLATE = """你是 Agent 的任务规划器。你的职责仅
+ {
+   "should_plan": true,
+   "steps": [
+-    {"id": "s1", "description": "明确、可验证的动作", "depends_on": []}
++    {
++      "id": "s1",
++      "description": "明确、可执行的动作",
++      "depends_on": [],
++      "success_criteria": "可验证的完成条件"
++    }
+   ]
+ }
+ 
+@@ -22,10 +28,33 @@ _PLANNER_PROMPT_TEMPLATE = """你是 Agent 的任务规划器。你的职责仅
+ - 简单问答、单次工具调用或一步即可完成的任务，返回 {"should_plan": false, "steps": []}。
+ - 只有确实需要多个相互依赖动作时才规划。
+ - 最多 {max_steps} 步；每步只描述一个动作。
++- 每步必须给出明确、可验证的 success_criteria。
+ - id 在当前计划中唯一；depends_on 只能引用当前计划中的步骤 id。
+ - 计划必须是无环图，避免重复、空泛或无法验证的步骤。
+ - 技能和工具只是可用能力，不要编造未列出的能力。"""
+ 
++_REPLAN_PROMPT_TEMPLATE = """你是 Agent 的重规划器。当前 Plan 中的一个步骤在有界重试后仍未通过验证。请返回一份完整的替代 Plan，不要执行任务。
++
++只输出一个 JSON 对象，格式与初始 Planner 相同：
++{
++  "should_plan": true,
++  "steps": [
++    {
++      "id": "s1",
++      "description": "明确、可执行的动作",
++      "depends_on": [],
++      "success_criteria": "可验证的完成条件"
++    }
++  ]
++}
++
++规则：
++- 返回完整 Plan，最多 {max_steps} 步，必须是无环图。
++- 已成功步骤如仍需要，必须原样保留 id、description、depends_on 和 success_criteria，以便复用结果。
++- 替换失败步骤时使用新 id，修正后续依赖。
++- 针对 failure_reason 更换方法、数据源或拆分方式，不要简单重复失败动作。
++- 技能和工具只是可用能力，不要编造未列出的能力。"""
++
+ 
+ class PlanningModel(Protocol):
+     async def chat_once(self, messages: list[dict]) -> str: ...
+@@ -55,6 +84,35 @@ class LLMPlanner(Planner):
+             # model failure must not prevent Runtime from executing the task.
+             return None
+ 
++    async def revise_plan(
++        self,
++        task: AgentTask,
++        context: PlanningContext,
++        current_plan: Plan,
++        step_runs: dict[str, StepRun],
++        failed_step: PlanStep,
++        reason: str,
++    ) -> Plan | None:
++        try:
++            request = self._build_replan_request(
++                task,
++                context,
++                current_plan,
++                step_runs,
++                failed_step,
++                reason,
++            )
++            response = await self.model.chat_once(request)
++            payload = self._parse_payload(response)
++            return self._build_plan(
++                task,
++                payload,
++                version=current_plan.version + 1,
++                source="replan",
++            )
++        except Exception:  # noqa: BLE001
++            return None
++
+     def _build_request(
+         self,
+         task: AgentTask,
+@@ -67,7 +125,13 @@ class LLMPlanner(Planner):
+             "recent_messages": [
+                 message.to_api_dict() for message in context.recent_messages
+             ],
+-            "skills": list(context.skill_names),
++            "skills": [
++                {
++                    "name": skill.name,
++                    "description": skill.description,
++                }
++                for skill in context.skills
++            ],
+             "tools": list(context.tool_names),
+         }
+         return [
+@@ -83,6 +147,47 @@ class LLMPlanner(Planner):
+             },
+         ]
+ 
++    def _build_replan_request(
++        self,
++        task: AgentTask,
++        context: PlanningContext,
++        current_plan: Plan,
++        step_runs: dict[str, StepRun],
++        failed_step: PlanStep,
++        reason: str,
++    ) -> list[dict[str, str]]:
++        payload = {
++            "goal": task.goal,
++            "input": task.input,
++            "summary": context.summary,
++            "recent_messages": [
++                message.to_api_dict() for message in context.recent_messages
++            ],
++            "skills": [
++                {"name": skill.name, "description": skill.description}
++                for skill in context.skills
++            ],
++            "tools": list(context.tool_names),
++            "current_plan": self._serialize_plan(current_plan),
++            "step_runs": {
++                step_id: self._serialize_run(run) for step_id, run in step_runs.items()
++            },
++            "failed_step": self._serialize_step(failed_step),
++            "failure_reason": reason,
++        }
++        return [
++            {
++                "role": "system",
++                "content": _REPLAN_PROMPT_TEMPLATE.replace(
++                    "{max_steps}", str(self.max_steps)
++                ),
++            },
++            {
++                "role": "user",
++                "content": json.dumps(payload, ensure_ascii=False, default=repr),
++            },
++        ]
++
+     @staticmethod
+     def _parse_payload(response: str) -> dict[str, Any]:
+         text = response.strip()
+@@ -109,6 +214,9 @@ class LLMPlanner(Planner):
+         self,
+         task: AgentTask,
+         payload: dict[str, Any],
++        *,
++        version: int = 1,
++        source: str = "planner",
+     ) -> Plan | None:
+         should_plan = payload.get("should_plan")
+         if not isinstance(should_plan, bool):
+@@ -131,6 +239,7 @@ class LLMPlanner(Planner):
+             step_id = raw_step.get("id")
+             description = raw_step.get("description")
+             depends_on = raw_step.get("depends_on", [])
++            success_criteria = raw_step.get("success_criteria")
+             if not isinstance(step_id, str) or not step_id.strip():
+                 raise ValueError("步骤 id 不能为空")
+             step_id = step_id.strip()
+@@ -143,19 +252,100 @@ class LLMPlanner(Planner):
+                 for dependency in depends_on
+             ):
+                 raise ValueError(f"步骤 {step_id} 的 depends_on 无效")
++            if success_criteria is not None and (
++                not isinstance(success_criteria, str) or not success_criteria.strip()
++            ):
++                raise ValueError(f"步骤 {step_id} 的 success_criteria 无效")
+ 
+-            normalized_dependencies = [dependency.strip() for dependency in depends_on]
++            normalized_dependencies = tuple(
++                dependency.strip() for dependency in depends_on
++            )
++            normalized_criteria = (
++                success_criteria.strip()
++                if success_criteria is not None
++                else f"完成步骤：{description.strip()}"
++            )
+             steps.append(
+                 PlanStep(
+                     id=step_id,
+                     description=description.strip(),
+                     depends_on=normalized_dependencies,
++                    success_criteria=normalized_criteria,
+                 )
+             )
+             seen_ids.add(step_id)
+ 
+         self._validate_graph(steps)
+-        return Plan(task_id=task.id, steps=steps)
++        return Plan(
++            task_id=task.id,
++            steps=tuple(steps),
++            version=version,
++            source=source,
++        )
++
++    @staticmethod
++    def _serialize_step(step: PlanStep) -> dict[str, Any]:
++        return {
++            "id": step.id,
++            "description": step.description,
++            "depends_on": list(step.depends_on),
++            "success_criteria": step.success_criteria,
++        }
++
++    @classmethod
++    def _serialize_plan(cls, plan: Plan) -> dict[str, Any]:
++        return {
++            "id": plan.id,
++            "version": plan.version,
++            "source": plan.source,
++            "steps": [cls._serialize_step(step) for step in plan.steps],
++        }
++
++    @classmethod
++    def _serialize_run(cls, run: StepRun) -> dict[str, Any]:
++        return {
++            "status": run.status.value,
++            "attempt_count": run.attempt_count,
++            "result": cls._serialize_result(run.result),
++            "verification": cls._serialize_verification(run.verification),
++            "result_history": [
++                cls._serialize_result(result) for result in run.result_history
++            ],
++            "verification_history": [
++                cls._serialize_verification(verification)
++                for verification in run.verification_history
++            ],
++            "error": run.error,
++        }
++
++    @staticmethod
++    def _serialize_result(result: StepResult | None) -> dict[str, Any] | None:
++        if result is None:
++            return None
++        return {
++            "success": result.success,
++            "output": result.output,
++            "evidence": list(result.evidence),
++            "artifacts": [
++                {"uri": artifact.uri, "kind": artifact.kind}
++                for artifact in result.artifacts
++            ],
++            "error": result.error,
++        }
++
++    @staticmethod
++    def _serialize_verification(
++        verification: StepVerification | None,
++    ) -> dict[str, Any] | None:
++        if verification is None:
++            return None
++        return {
++            "passed": verification.passed,
++            "reason": verification.reason,
++            "retryable": verification.retryable,
++            "evidence": list(verification.evidence),
++            "error": verification.error,
++        }
+ 
+     # 三色标记判定图内是否有环
+     @staticmethod
+diff --git a/sparkos/agent/planner.py b/sparkos/agent/planner.py
+index 3d4c527..eded169 100644
+--- a/sparkos/agent/planner.py
++++ b/sparkos/agent/planner.py
+@@ -8,35 +8,72 @@ from __future__ import annotations
+ 
+ import uuid
+ from dataclasses import dataclass, field
+-from enum import StrEnum
+-from typing import Protocol
++from typing import TYPE_CHECKING, Protocol
+ 
+ from sparkos.agent.task import AgentTask
+ from sparkos.infrastructure.llm.models import ChatMessage
+ 
++if TYPE_CHECKING:
++    from sparkos.agent.step import StepRun
+ 
+-class PlanStepStatus(StrEnum):
+-    PENDING = "pending"
+-    RUNNING = "running"
+-    SUCCEEDED = "succeeded"
+-    FAILED = "failed"
+-    SKIPPED = "skipped"
+ 
+-
+-@dataclass
++@dataclass(frozen=True)
+ class PlanStep:
+     description: str
+     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+-    depends_on: list[str] = field(default_factory=list)
+-    status: PlanStepStatus = PlanStepStatus.PENDING
++    depends_on: tuple[str, ...] = ()
++    success_criteria: str = ""
+ 
+ 
+-@dataclass
++@dataclass(frozen=True)
+ class Plan:
+     task_id: str
+-    steps: list[PlanStep]
++    steps: tuple[PlanStep, ...]
+     id: str = field(default_factory=lambda: uuid.uuid4().hex)
+     version: int = 1
++    source: str = "planner"
++
++    def __post_init__(self) -> None:
++        if not self.steps:
++            raise ValueError("Plan 至少需要一个步骤")
++
++        step_ids = [step.id for step in self.steps]
++        if len(step_ids) != len(set(step_ids)):
++            raise ValueError("Plan 包含重复的步骤 id")
++
++        known_ids = set(step_ids)
++        graph = {step.id: step.depends_on for step in self.steps}
++        for step in self.steps:
++            for dependency in step.depends_on:
++                if dependency not in known_ids:
++                    raise ValueError(f"步骤 {step.id} 引用了未知依赖：{dependency}")
++                if dependency == step.id:
++                    raise ValueError(f"步骤 {step.id} 不能依赖自身")
++
++        visiting: set[str] = set()
++        visited: set[str] = set()
++
++        def visit(step_id: str) -> None:
++            if step_id in visiting:
++                raise ValueError("Plan 依赖图存在环")
++            if step_id in visited:
++                return
++            visiting.add(step_id)
++            for dependency in graph[step_id]:
++                visit(dependency)
++            visiting.remove(step_id)
++            visited.add(step_id)
++
++        for step_id in graph:
++            visit(step_id)
++
++
++@dataclass(frozen=True)
++class SkillCapability:
++    """Skill metadata available to a Planner without loading its full body."""
++
++    name: str
++    description: str
+ 
+ 
+ @dataclass(frozen=True)
+@@ -46,9 +83,14 @@ class PlanningContext:
+     session_id: str | None
+     summary: str
+     recent_messages: tuple[ChatMessage, ...]
+-    skill_names: tuple[str, ...]
++    skills: tuple[SkillCapability, ...]
+     tool_names: tuple[str, ...]
+ 
++    @property
++    def skill_names(self) -> tuple[str, ...]:
++        """Compatibility view for Planner implementations that only need names."""
++        return tuple(skill.name for skill in self.skills)
++
+ 
+ class Planner(Protocol):
+     async def create_plan(
+@@ -60,10 +102,25 @@ class Planner(Protocol):
+         ...
+ 
+ 
++class Replanner(Protocol):
++    async def revise_plan(
++        self,
++        task: AgentTask,
++        context: PlanningContext,
++        current_plan: Plan,
++        step_runs: dict[str, StepRun],
++        failed_step: PlanStep,
++        reason: str,
++    ) -> Plan | None:
++        """Return a complete replacement Plan or None when revision fails."""
++        ...
++
++
+ __all__ = [
+     "Plan",
+     "PlanStep",
+-    "PlanStepStatus",
+     "Planner",
+     "PlanningContext",
++    "Replanner",
++    "SkillCapability",
+ ]
+diff --git a/sparkos/agent/retry.py b/sparkos/agent/retry.py
+new file mode 100644
+index 0000000..2429668
+--- /dev/null
++++ b/sparkos/agent/retry.py
+@@ -0,0 +1,32 @@
++"""Deterministic retry decisions for rejected Step attempts."""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++
++from sparkos.agent.step import StepRun, StepVerification
++
++
++@dataclass(frozen=True)
++class RetryPolicy:
++    max_attempts: int = 2
++
++    def __post_init__(self) -> None:
++        if self.max_attempts < 1:
++            raise ValueError("max_attempts 必须大于等于 1")
++        if self.max_attempts > 2:
++            raise ValueError("每个步骤最多允许 2 次尝试")
++
++    def should_retry(
++        self,
++        run: StepRun,
++        verification: StepVerification,
++    ) -> bool:
++        return (
++            not verification.passed
++            and verification.retryable
++            and run.attempt_count < self.max_attempts
++        )
++
++
++__all__ = ["RetryPolicy"]
+diff --git a/sparkos/agent/runtime.py b/sparkos/agent/runtime.py
+index a07505d..5a813d3 100644
+--- a/sparkos/agent/runtime.py
++++ b/sparkos/agent/runtime.py
+@@ -1,32 +1,66 @@
+-"""Agent task orchestration and model/tool execution loop."""
++"""Agent task orchestration across planning, step execution, and synthesis."""
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+-import inspect
+ import json
+-from collections.abc import AsyncIterator, Awaitable, Callable
+-from typing import Any, Protocol
++from collections.abc import AsyncIterator
++from dataclasses import replace
++from typing import Any, Protocol, cast
+ 
+ from sparkos.agent.context import WINDOW, AgentContext
+ from sparkos.agent.events import (
+     AgentEvent,
+     PlanCreated,
++    PlanReplanned,
++    StepCompleted,
++    StepFailed,
++    StepRetrying,
++    StepStarted,
++    StepToolCompleted,
++    StepVerificationCompleted,
+     TaskCompleted,
+     TaskFailed,
+     TaskStarted,
+     TextDelta,
+-    ToolCompleted,
+ )
+ from sparkos.agent.llm_planner import LLMPlanner
+-from sparkos.agent.planner import Plan, Planner, PlanningContext
++from sparkos.agent.planner import (
++    Plan,
++    Planner,
++    PlanningContext,
++    PlanStep,
++    Replanner,
++    SkillCapability,
++)
++from sparkos.agent.retry import RetryPolicy
++from sparkos.agent.scheduler import (
++    PlanScheduler,
++    create_direct_plan,
++    create_step_runs,
++)
+ from sparkos.agent.skills.loader import Skill, load_skills
++from sparkos.agent.step import (
++    StepResult,
++    StepRun,
++    StepStatus,
++    StepVerification,
++)
++from sparkos.agent.step_executor import (
++    StepExecution,
++    StepExecutionError,
++    StepExecutor,
++    StepToolExecution,
++    StepTranscriptUpdate,
++    ToolExecutor,
++)
+ from sparkos.agent.task import AgentTask
++from sparkos.agent.task_store import TaskStore
+ from sparkos.agent.tools.registry import TOOL_DEFINITIONS, execute_tool
++from sparkos.agent.verifier import LLMStepVerifier, StepVerifier
+ from sparkos.infrastructure.llm.client import OpenAIChatClient
+ from sparkos.infrastructure.llm.models import ChatConfig, ChatMessage, ToolCall
+-
+-ToolExecutor = Callable[[str, dict[str, Any]], str | Awaitable[str]]
++from sparkos.infrastructure.persistence.task_store import JsonTaskStore
+ 
+ 
+ class ModelClient(Protocol):
+@@ -40,7 +74,7 @@ class ModelClient(Protocol):
+ 
+ 
+ class AgentRuntime:
+-    """Execute independent AgentTask objects against one conversation context."""
++    """Own the lifecycle of one task while sharing a conversation context."""
+ 
+     def __init__(
+         self,
+@@ -54,9 +88,21 @@ class AgentRuntime:
+         planner: Planner | None = None,
+         enable_planning: bool = False,
+         max_tool_rounds: int = 8,
++        task_store: TaskStore | None = None,
++        scheduler: PlanScheduler | None = None,
++        step_executor: StepExecutor | None = None,
++        verifier: StepVerifier | None = None,
++        enable_verification: bool = False,
++        retry_policy: RetryPolicy | None = None,
++        replanner: Replanner | None = None,
++        max_replans: int = 1,
+     ) -> None:
+         if max_tool_rounds < 0:
+             raise ValueError("max_tool_rounds 不能小于 0")
++        if max_replans < 0:
++            raise ValueError("max_replans 不能小于 0")
++        if max_replans > 1:
++            raise ValueError("每个任务最多允许 1 次重规划")
+ 
+         self.config = config or ChatConfig.from_yaml()
+         self.context = context or AgentContext()
+@@ -66,135 +112,438 @@ class AgentRuntime:
+         self.tool_executor = tool_executor
+         self.planner = planner or (LLMPlanner(self.client) if enable_planning else None)
+         self.max_tool_rounds = max_tool_rounds
++        self.task_store = task_store if task_store is not None else JsonTaskStore()
++        self.scheduler = scheduler or PlanScheduler()
++        self.step_executor = step_executor or StepExecutor(
++            client=self.client,
++            tools=self.tools,
++            tool_executor=self.tool_executor,
++            max_tool_rounds=max_tool_rounds,
++        )
++        self.verifier = verifier or (
++            LLMStepVerifier(self.client) if enable_verification else None
++        )
++        self.retry_policy = retry_policy or RetryPolicy(max_attempts=2)
++        if replanner is not None:
++            self.replanner = replanner
++        elif self.planner is not None and hasattr(self.planner, "revise_plan"):
++            self.replanner = cast(Replanner, self.planner)
++        else:
++            self.replanner = None
++        self.max_replans = max_replans
+ 
+     async def run(
+         self,
+         task: AgentTask,
+         skill_name: str | None = None,
+     ) -> AsyncIterator[AgentEvent]:
+-        """Run one task and emit lifecycle, text, planning, and tool events."""
+-        task.start()
+-        self.context.record_user(task.goal)
+-        self.context.ensure_session()
+-        yield TaskStarted(task)
++        """Plan and execute one task, emitting task- and step-scoped events."""
++        plan: Plan | None = None
++        step_runs: dict[str, StepRun] = {}
++        active_run: StepRun | None = None
++        retry_feedback_by_step: dict[str, str] = {}
++        replan_count = 0
+ 
+         try:
++            task.start_planning()
++            self.context.record_user(task.goal)
++            self.context.ensure_session()
++            yield TaskStarted(task)
++
+             await self._compact_if_needed()
+ 
+-            plan: Plan | None = None
+             if self.planner is not None:
+                 plan = await self.planner.create_plan(task, self._planning_context())
+-                if plan is not None:
+-                    task.active_plan_id = plan.id
+-                    yield PlanCreated(plan)
++            if plan is None:
++                plan = create_direct_plan(task)
++
++            task.active_plan_id = plan.id
++            step_runs = create_step_runs(plan)
++            self._save_task(task, plan, step_runs)
++            yield PlanCreated(plan)
+ 
+-            messages = self.context.build_messages(
++            task.start()
++            self._save_task(task, plan, step_runs)
++            base_messages = self.context.build_messages(
+                 skills=self.skills,
+                 tools=self.tools,
+                 skill_name=skill_name,
+             )
+-            if plan is not None:
+-                self._inject_plan(messages, plan)
+-            answer_parts: list[str] = []
+-            tool_rounds = 0
+-
+-            while True:
+-                turn_parts: list[str] = []
+-                tool_calls: list[ToolCall] = []
+ 
+-                async for item in self.client.chat_stream(
+-                    messages,
+-                    tools=self.tools or None,
+-                ):
+-                    if isinstance(item, str):
+-                        turn_parts.append(item)
+-                        answer_parts.append(item)
+-                        yield TextDelta(item)
+-                    else:
+-                        tool_calls.append(item)
+-
+-                turn_text = "".join(turn_parts)
+-                serialized_calls = (
+-                    [tool_call.to_api_dict() for tool_call in tool_calls]
+-                    if tool_calls
+-                    else None
+-                )
+-                assistant_message = ChatMessage(
+-                    role="assistant",
+-                    content=turn_text,
+-                    tool_calls=serialized_calls,
+-                )
+-                self.context.record_assistant(turn_text, serialized_calls)
+-                messages.append(assistant_message)
+-
+-                if not tool_calls:
+-                    break
+-
+-                if tool_rounds >= self.max_tool_rounds:
+-                    error = f"工具调用轮数超过限制（{self.max_tool_rounds}）"
+-                    for tool_call in tool_calls:
+-                        tool_call.result = error
+-                        self._record_tool_result(messages, tool_call)
+-                        yield ToolCompleted(tool_call)
++            while not self.scheduler.is_complete(step_runs):
++                self.scheduler.block_failed_dependents(plan, step_runs)
++                if self.scheduler.has_failed(step_runs):
++                    self._save_task(task, plan, step_runs)
++                    raise RuntimeError("计划包含失败或被阻塞的步骤")
++
++                ready_steps = self.scheduler.ready_steps(plan, step_runs)
++                if not ready_steps:
++                    raise RuntimeError("计划无可执行步骤，请检查依赖关系")
++
++                # Phase 1 intentionally executes one ready step at a time. The
++                # scheduler API already leaves room for parallel execution later.
++                step = ready_steps[0]
++                run = step_runs[step.id]
++                run.start()
++                active_run = run
++                self._save_task(task, plan, step_runs)
++                yield StepStarted(step)
++
++                dependency_results = {
++                    dependency: step_runs[dependency].result
++                    for dependency in step.depends_on
++                    if step_runs[dependency].result is not None
++                }
++                retry_feedback = retry_feedback_by_step.pop(step.id, None)
++                execution: StepExecution | None = None
++                try:
++                    async for update in self.step_executor.stream(
++                        task=task,
++                        step=step,
++                        dependency_results=dependency_results,
++                        base_messages=base_messages,
++                        retry_feedback=retry_feedback,
++                    ):
++                        if isinstance(update, StepTranscriptUpdate):
++                            run.record_transcript(update.transcript)
++                            self._save_task(task, plan, step_runs)
++                        elif isinstance(update, StepToolExecution):
++                            run.record_transcript(update.transcript)
++                            self._save_task(task, plan, step_runs)
++                            yield StepToolCompleted(
++                                step=step,
++                                tool_call=update.tool_call,
++                            )
++                        else:
++                            execution = update
++                except Exception as exc:
++                    error = str(exc)
++                    if isinstance(exc, StepExecutionError):
++                        run.record_transcript(exc.transcript)
++                    run.fail(error)
++                    active_run = None
++                    self._save_task(task, plan, step_runs)
++                    yield StepFailed(step=step, error=error)
++                    raise
++
++                if execution is None:
++                    error = "步骤执行未返回结果"
++                    run.fail(error)
++                    active_run = None
++                    self._save_task(task, plan, step_runs)
++                    yield StepFailed(step=step, error=error)
+                     raise RuntimeError(error)
+ 
+-                tool_rounds += 1
+-                for tool_call in tool_calls:
+-                    tool_call.result = await self._execute_tool_call(tool_call)
+-                    self._record_tool_result(messages, tool_call)
+-                    yield ToolCompleted(tool_call)
++                run.record_transcript(execution.transcript)
++
++                if not execution.result.success:
++                    error = execution.result.error or "步骤执行失败"
++                    run.fail(error, execution.result)
++                    active_run = None
++                    self.scheduler.block_failed_dependents(plan, step_runs)
++                    self._save_task(task, plan, step_runs)
++                    yield StepFailed(step=step, error=error)
++                    raise RuntimeError(error)
+ 
+-            task.succeed("".join(answer_parts))
++                accepted_result = execution.result
++                if self.verifier is not None:
++                    run.begin_verification(accepted_result)
++                    self._save_task(task, plan, step_runs)
++                    try:
++                        verification = await self.verifier.verify(
++                            task=task,
++                            step=step,
++                            result=accepted_result,
++                            dependency_results=dependency_results,
++                        )
++                    except Exception as exc:  # noqa: BLE001
++                        verification = StepVerification(
++                            passed=True,
++                            reason="验证器不可用，按兼容策略放行",
++                            retryable=False,
++                            error=f"{type(exc).__name__}: {exc}",
++                        )
++                    run.record_verification(verification)
++                    self._save_task(task, plan, step_runs)
++                    yield StepVerificationCompleted(
++                        step=step,
++                        verification=verification,
++                    )
++
++                    if not verification.passed:
++                        error = verification.reason
++                        if self.retry_policy.should_retry(run, verification):
++                            next_attempt = run.attempt_count + 1
++                            run.prepare_retry()
++                            active_run = None
++                            retry_feedback_by_step[step.id] = error
++                            self._save_task(task, plan, step_runs)
++                            yield StepRetrying(
++                                step=step,
++                                attempt=next_attempt,
++                                reason=error,
++                            )
++                            continue
++
++                        run.fail(error, accepted_result)
++                        active_run = None
++                        self.scheduler.block_failed_dependents(plan, step_runs)
++                        self._save_task(task, plan, step_runs)
++                        yield StepFailed(step=step, error=error)
++                        if (
++                            self.replanner is not None
++                            and replan_count < self.max_replans
++                        ):
++                            revised_plan = await self._revise_plan(
++                                task=task,
++                                plan=plan,
++                                step_runs=step_runs,
++                                failed_step=step,
++                                reason=error,
++                            )
++                            if revised_plan is not None:
++                                previous_plan = plan
++                                step_runs = self._reconcile_step_runs(
++                                    previous_plan,
++                                    revised_plan,
++                                    step_runs,
++                                )
++                                plan = revised_plan
++                                task.active_plan_id = plan.id
++                                retry_feedback_by_step.clear()
++                                replan_count += 1
++                                self._save_task(task, plan, step_runs)
++                                yield PlanReplanned(
++                                    previous_plan=previous_plan,
++                                    plan=plan,
++                                    reason=error,
++                                )
++                                continue
++                        raise RuntimeError(error)
++
++                    evidence = tuple(
++                        dict.fromkeys(
++                            (*accepted_result.evidence, *verification.evidence)
++                        )
++                    )
++                    accepted_result = replace(
++                        accepted_result,
++                        evidence=evidence,
++                    )
++
++                run.succeed(accepted_result)
++                active_run = None
++                self._save_task(task, plan, step_runs)
++                yield StepCompleted(step=step, result=accepted_result)
++
++            if plan.source == "direct":
++                final_answer = step_runs[plan.steps[0].id].result
++                answer = final_answer.output if final_answer is not None else ""
++                if answer:
++                    yield TextDelta(answer)
++            else:
++                answer_parts: list[str] = []
++                async for delta in self._synthesize_final(
++                    task=task,
++                    plan=plan,
++                    step_runs=step_runs,
++                    base_messages=base_messages,
++                ):
++                    answer_parts.append(delta)
++                answer = "".join(answer_parts).strip()
++                if not answer or self._is_textual_tool_call(answer):
++                    answer = self._fallback_answer(plan, step_runs)
++                if answer:
++                    yield TextDelta(answer)
++
++            task.succeed(answer)
++            self.context.record_assistant(answer)
+             self.context.persist()
++            self._save_task(task, plan, step_runs)
+             yield TaskCompleted(task)
+ 
++        except GeneratorExit:
++            task.cancel()
++            if active_run is not None and active_run.status in {
++                StepStatus.RUNNING,
++                StepStatus.VERIFYING,
++            }:
++                active_run.cancel()
++            self.context.persist()
++            if plan is not None:
++                self._save_task_best_effort(task, plan, step_runs)
++            return
+         except asyncio.CancelledError:
+             task.cancel()
++            if active_run is not None and active_run.status in {
++                StepStatus.RUNNING,
++                StepStatus.VERIFYING,
++            }:
++                active_run.cancel()
+             self.context.persist()
++            if plan is not None:
++                self._save_task_best_effort(task, plan, step_runs)
+             raise
+         except Exception as exc:
+             task.fail(str(exc))
+             self.context.persist()
++            if plan is not None:
++                self._save_task_best_effort(task, plan, step_runs)
+             yield TaskFailed(task)
+             raise
+ 
+-    def _record_tool_result(
++    async def _synthesize_final(
+         self,
++        task: AgentTask,
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++        base_messages: list[ChatMessage],
++    ) -> AsyncIterator[str]:
++        messages = list(base_messages)
++        payload = {
++            "task_goal": task.goal,
++            "task_input": task.input,
++            "step_results": [
++                {
++                    "step_id": step.id,
++                    "description": step.description,
++                    "result": self._serialize_result(step_runs[step.id].result),
++                }
++                for step in plan.steps
++            ],
++        }
++        self._insert_system_message(
++            messages,
++            "所有计划步骤已完成。请基于 step_results 给出直接、完整的最终答案，"
++            "不要暴露内部执行过程。\n"
++            f"{json.dumps(payload, ensure_ascii=False, default=repr)}",
++        )
++        async for item in self.client.chat_stream(messages, tools=None):
++            if isinstance(item, ToolCall):
++                raise TypeError("最终结果汇总阶段不允许调用工具")
++            yield item
++
++    @staticmethod
++    def _serialize_result(result: StepResult | None) -> dict[str, Any] | None:
++        if result is None:
++            return None
++        return {
++            "success": result.success,
++            "output": result.output,
++            "evidence": list(result.evidence),
++            "artifacts": [
++                {"uri": artifact.uri, "kind": artifact.kind}
++                for artifact in result.artifacts
++            ],
++            "error": result.error,
++        }
++
++    @staticmethod
++    def _fallback_answer(plan: Plan, step_runs: dict[str, StepRun]) -> str:
++        for step in reversed(plan.steps):
++            result = step_runs[step.id].result
++            if result is not None and result.output:
++                return result.output
++        return ""
++
++    @staticmethod
++    def _is_textual_tool_call(text: str) -> bool:
++        normalized = text.lstrip().casefold()
++        return normalized.startswith("<tool_call") and "</tool_call>" in normalized
++
++    @staticmethod
++    def _insert_system_message(
+         messages: list[ChatMessage],
+-        tool_call: ToolCall,
++        content: str,
+     ) -> None:
+-        self.context.record_tool(tool_call.call_id, tool_call.result)
+-        messages.append(
+-            ChatMessage(
+-                role="tool",
+-                content=tool_call.result,
+-                tool_call_id=tool_call.call_id,
+-            )
++        insertion_index = next(
++            (
++                index
++                for index, message in enumerate(messages)
++                if message.role != "system"
++            ),
++            len(messages),
++        )
++        messages.insert(
++            insertion_index,
++            ChatMessage(role="system", content=content),
+         )
+ 
+-    async def _execute_tool_call(self, tool_call: ToolCall) -> str:
+-        if self.tool_executor is None:
+-            return "工具执行失败：未配置工具执行器"
++    def _save_task(
++        self,
++        task: AgentTask,
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++    ) -> None:
++        self.task_store.save(task, plan, step_runs)
+ 
++    async def _revise_plan(
++        self,
++        task: AgentTask,
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++        failed_step: PlanStep,
++        reason: str,
++    ) -> Plan | None:
++        assert self.replanner is not None
+         try:
+-            arguments = json.loads(tool_call.arguments or "{}")
+-        except json.JSONDecodeError as exc:
+-            return f"工具参数不是有效 JSON：{exc}"
++            revised = await self.replanner.revise_plan(
++                task=task,
++                context=self._planning_context(),
++                current_plan=plan,
++                step_runs=step_runs,
++                failed_step=failed_step,
++                reason=reason,
++            )
++        except Exception:  # noqa: BLE001
++            return None
++        if revised is None:
++            return None
++        if revised.task_id != task.id:
++            return None
++        if revised.id == plan.id:
++            return None
++        if revised.version != plan.version + 1:
++            return None
++        if revised.source != "replan":
++            return None
++        for revised_step in revised.steps:
++            if revised_step.id == failed_step.id:
++                return None
++        return revised
+ 
+-        try:
+-            if inspect.iscoroutinefunction(self.tool_executor):
+-                result = await self.tool_executor(tool_call.name, arguments)
++    @staticmethod
++    def _reconcile_step_runs(
++        previous_plan: Plan,
++        revised_plan: Plan,
++        previous_runs: dict[str, StepRun],
++    ) -> dict[str, StepRun]:
++        previous_steps = {step.id: step for step in previous_plan.steps}
++        reconciled: dict[str, StepRun] = {}
++        for step in revised_plan.steps:
++            previous_run = previous_runs.get(step.id)
++            if (
++                previous_run is not None
++                and previous_run.status == StepStatus.SUCCEEDED
++                and previous_steps.get(step.id) == step
++            ):
++                reconciled[step.id] = previous_run
+             else:
+-                result = await asyncio.to_thread(
+-                    self.tool_executor,
+-                    tool_call.name,
+-                    arguments,
+-                )
+-            if inspect.isawaitable(result):
+-                result = await result
+-            return str(result)
+-        except Exception as exc:  # noqa: BLE001
+-            return f"工具执行失败：{type(exc).__name__}: {exc}"
++                reconciled[step.id] = StepRun(step_id=step.id)
++        return reconciled
++
++    def _save_task_best_effort(
++        self,
++        task: AgentTask,
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++    ) -> None:
++        try:
++            self._save_task(task, plan, step_runs)
++        except Exception:  # noqa: BLE001
++            # Preserve the original execution/cancellation exception. A failed
++            # primary snapshot save has already made the task fail.
++            return
+ 
+     async def _compact_if_needed(self) -> bool:
+         request = self.context.build_compaction_request()
+@@ -218,41 +567,15 @@ class AgentRuntime:
+             session_id=self.context.session_id,
+             summary=self.context.summary,
+             recent_messages=tuple(self.context.history[self.context.summary_upto :]),
+-            skill_names=tuple(skill.name for skill in self.skills),
+-            tool_names=tool_names,
+-        )
+-
+-    @staticmethod
+-    def _inject_plan(messages: list[ChatMessage], plan: Plan) -> None:
+-        plan_payload = {
+-            "plan_id": plan.id,
+-            "version": plan.version,
+-            "steps": [
+-                {
+-                    "id": step.id,
+-                    "description": step.description,
+-                    "depends_on": step.depends_on,
+-                }
+-                for step in plan.steps
+-            ],
+-        }
+-        plan_message = ChatMessage(
+-            role="system",
+-            content=(
+-                "当前任务已生成以下执行计划。请遵守依赖关系逐步执行；"
+-                "如果现实信息与计划冲突，可以调整执行细节，但不要跳过任务目标。\n"
+-                f"{json.dumps(plan_payload, ensure_ascii=False)}"
+-            ),
+-        )
+-        insertion_index = next(
+-            (
+-                index
+-                for index, message in enumerate(messages)
+-                if message.role != "system"
++            skills=tuple(
++                SkillCapability(
++                    name=skill.name,
++                    description=skill.description,
++                )
++                for skill in self.skills
+             ),
+-            len(messages),
++            tool_names=tool_names,
+         )
+-        messages.insert(insertion_index, plan_message)
+ 
+     def get_tools(self) -> list[dict[str, Any]]:
+         return self.tools
+diff --git a/sparkos/agent/scheduler.py b/sparkos/agent/scheduler.py
+new file mode 100644
+index 0000000..a4f3024
+--- /dev/null
++++ b/sparkos/agent/scheduler.py
+@@ -0,0 +1,83 @@
++"""Deterministic serial scheduling for Plan dependency graphs."""
++
++from __future__ import annotations
++
++from sparkos.agent.planner import Plan, PlanStep
++from sparkos.agent.step import StepRun, StepStatus
++from sparkos.agent.task import AgentTask
++
++
++def create_step_runs(plan: Plan) -> dict[str, StepRun]:
++    return {step.id: StepRun(step_id=step.id) for step in plan.steps}
++
++
++def create_direct_plan(task: AgentTask) -> Plan:
++    return Plan(
++        task_id=task.id,
++        source="direct",
++        steps=(
++            PlanStep(
++                id="direct",
++                description=task.goal,
++                depends_on=(),
++                success_criteria="完整、准确地完成用户目标",
++            ),
++        ),
++    )
++
++
++class PlanScheduler:
++    """Compute ready and terminal state without model or I/O dependencies."""
++
++    @staticmethod
++    def ready_steps(
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++    ) -> list[PlanStep]:
++        return [
++            step
++            for step in plan.steps
++            if step_runs[step.id].status == StepStatus.PENDING
++            and all(
++                step_runs[dependency].status == StepStatus.SUCCEEDED
++                for dependency in step.depends_on
++            )
++        ]
++
++    @staticmethod
++    def block_failed_dependents(
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++    ) -> None:
++        changed = True
++        while changed:
++            changed = False
++            for step in plan.steps:
++                run = step_runs[step.id]
++                if run.status != StepStatus.PENDING:
++                    continue
++                failed_dependencies = [
++                    dependency
++                    for dependency in step.depends_on
++                    if step_runs[dependency].status
++                    in {StepStatus.FAILED, StepStatus.BLOCKED}
++                ]
++                if failed_dependencies:
++                    run.block("依赖步骤失败：" + ", ".join(failed_dependencies))
++                    changed = True
++
++    @staticmethod
++    def is_complete(step_runs: dict[str, StepRun]) -> bool:
++        return bool(step_runs) and all(
++            run.status == StepStatus.SUCCEEDED for run in step_runs.values()
++        )
++
++    @staticmethod
++    def has_failed(step_runs: dict[str, StepRun]) -> bool:
++        return any(
++            run.status in {StepStatus.FAILED, StepStatus.BLOCKED}
++            for run in step_runs.values()
++        )
++
++
++__all__ = ["PlanScheduler", "create_direct_plan", "create_step_runs"]
+diff --git a/sparkos/agent/step.py b/sparkos/agent/step.py
+new file mode 100644
+index 0000000..d38344c
+--- /dev/null
++++ b/sparkos/agent/step.py
+@@ -0,0 +1,114 @@
++"""Execution state and results for immutable plan steps."""
++
++from __future__ import annotations
++
++from copy import deepcopy
++from dataclasses import dataclass, field
++from enum import StrEnum
++from typing import Any
++
++
++class StepStatus(StrEnum):
++    PENDING = "pending"
++    RUNNING = "running"
++    VERIFYING = "verifying"
++    SUCCEEDED = "succeeded"
++    FAILED = "failed"
++    BLOCKED = "blocked"
++    SKIPPED = "skipped"
++    CANCELLED = "cancelled"
++
++
++@dataclass(frozen=True)
++class ArtifactRef:
++    uri: str
++    kind: str
++
++
++@dataclass(frozen=True)
++class StepResult:
++    success: bool
++    output: str
++    evidence: tuple[str, ...] = ()
++    artifacts: tuple[ArtifactRef, ...] = ()
++    error: str | None = None
++
++
++@dataclass(frozen=True)
++class StepVerification:
++    passed: bool
++    reason: str
++    retryable: bool
++    evidence: tuple[str, ...] = ()
++    error: str | None = None
++
++
++@dataclass
++class StepRun:
++    step_id: str
++    status: StepStatus = StepStatus.PENDING
++    attempt_count: int = 0
++    result: StepResult | None = None
++    error: str | None = None
++    transcript: list[dict[str, Any]] = field(default_factory=list)
++    verification: StepVerification | None = None
++    verification_history: list[StepVerification] = field(default_factory=list)
++    result_history: list[StepResult] = field(default_factory=list)
++    transcript_history: list[list[dict[str, Any]]] = field(default_factory=list)
++
++    def start(self) -> None:
++        self.status = StepStatus.RUNNING
++        self.attempt_count += 1
++        self.error = None
++
++    def succeed(self, result: StepResult) -> None:
++        self.status = StepStatus.SUCCEEDED
++        self.result = result
++        self.error = None
++
++    def begin_verification(self, result: StepResult) -> None:
++        self.status = StepStatus.VERIFYING
++        self.result = result
++        self.error = None
++
++    def record_verification(self, verification: StepVerification) -> None:
++        self.verification = verification
++        self.verification_history.append(verification)
++
++    def prepare_retry(self) -> None:
++        if self.result is not None:
++            self.result_history.append(self.result)
++        if self.transcript:
++            self.transcript_history.append(deepcopy(self.transcript))
++        self.status = StepStatus.PENDING
++        self.result = None
++        self.error = None
++        self.transcript = []
++        self.verification = None
++
++    def fail(self, error: str, result: StepResult | None = None) -> None:
++        self.status = StepStatus.FAILED
++        self.result = result
++        self.error = error
++
++    def block(self, reason: str) -> None:
++        self.status = StepStatus.BLOCKED
++        self.error = reason
++
++    def cancel(self) -> None:
++        self.status = StepStatus.CANCELLED
++
++    def record_transcript(
++        self,
++        transcript: tuple[dict[str, Any], ...] | list[dict[str, Any]],
++    ) -> None:
++        self.transcript = deepcopy(list(transcript))
++
++
++__all__ = [
++    "ArtifactRef",
++    "StepResult",
++    "StepRun",
++    "StepStatus",
++    "StepVerification",
++]
+diff --git a/sparkos/agent/step_executor.py b/sparkos/agent/step_executor.py
+new file mode 100644
+index 0000000..4354e39
+--- /dev/null
++++ b/sparkos/agent/step_executor.py
+@@ -0,0 +1,325 @@
++"""Bounded model/tool loop for one immutable PlanStep."""
++
++from __future__ import annotations
++
++import asyncio
++import inspect
++import json
++from collections.abc import AsyncIterator, Awaitable, Callable
++from copy import deepcopy
++from dataclasses import dataclass
++from typing import Any, Protocol
++
++from sparkos.agent.planner import PlanStep
++from sparkos.agent.step import ArtifactRef, StepResult
++from sparkos.agent.task import AgentTask
++from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
++
++type ToolExecutor = Callable[[str, dict[str, Any]], str | Awaitable[str]]
++
++
++class StepModel(Protocol):
++    async def chat_stream(
++        self,
++        messages: list[ChatMessage],
++        tools: list[dict[str, Any]] | None = None,
++    ) -> AsyncIterator[str | ToolCall]: ...
++
++
++class StepExecutionError(RuntimeError):
++    def __init__(
++        self,
++        message: str,
++        transcript: tuple[dict[str, Any], ...] = (),
++    ) -> None:
++        super().__init__(message)
++        self.transcript = deepcopy(transcript)
++
++
++@dataclass(frozen=True)
++class StepToolExecution:
++    tool_call: ToolCall
++    transcript: tuple[dict[str, Any], ...]
++
++
++@dataclass(frozen=True)
++class StepTranscriptUpdate:
++    transcript: tuple[dict[str, Any], ...]
++
++
++@dataclass(frozen=True)
++class StepExecution:
++    result: StepResult
++    tool_calls: tuple[ToolCall, ...] = ()
++    transcript: tuple[dict[str, Any], ...] = ()
++
++
++class StepExecutor:
++    def __init__(
++        self,
++        client: StepModel,
++        tools: list[dict[str, Any]],
++        tool_executor: ToolExecutor | None,
++        max_tool_rounds: int = 8,
++    ) -> None:
++        if max_tool_rounds < 0:
++            raise ValueError("max_tool_rounds 不能小于 0")
++        self.client = client
++        self.tools = tools
++        self.tool_executor = tool_executor
++        self.max_tool_rounds = max_tool_rounds
++
++    async def execute(
++        self,
++        task: AgentTask,
++        step: PlanStep,
++        dependency_results: dict[str, StepResult],
++        base_messages: list[ChatMessage],
++        retry_feedback: str | None = None,
++    ) -> StepExecution:
++        execution: StepExecution | None = None
++        async for update in self.stream(
++            task=task,
++            step=step,
++            dependency_results=dependency_results,
++            base_messages=base_messages,
++            retry_feedback=retry_feedback,
++        ):
++            if isinstance(update, StepExecution):
++                execution = update
++        if execution is None:
++            raise StepExecutionError("步骤执行未返回结果")
++        return execution
++
++    async def stream(
++        self,
++        task: AgentTask,
++        step: PlanStep,
++        dependency_results: dict[str, StepResult],
++        base_messages: list[ChatMessage],
++        retry_feedback: str | None = None,
++    ) -> AsyncIterator[StepTranscriptUpdate | StepToolExecution | StepExecution]:
++        messages = list(base_messages)
++        self._inject_step_context(
++            messages,
++            task,
++            step,
++            dependency_results,
++            retry_feedback,
++        )
++        transcript: list[dict[str, Any]] = []
++        executed_calls: list[ToolCall] = []
++        tool_rounds = 0
++        empty_result_retries = 0
++
++        while True:
++            turn_parts: list[str] = []
++            tool_calls: list[ToolCall] = []
++            try:
++                async for item in self.client.chat_stream(
++                    messages,
++                    tools=self.tools or None,
++                ):
++                    if isinstance(item, str):
++                        turn_parts.append(item)
++                    else:
++                        tool_calls.append(item)
++            except asyncio.CancelledError:
++                raise
++            except Exception as exc:
++                if turn_parts:
++                    partial_message = ChatMessage(
++                        role="assistant",
++                        content="".join(turn_parts),
++                    )
++                    transcript.append(partial_message.to_api_dict())
++                raise StepExecutionError(
++                    f"步骤模型调用失败：{type(exc).__name__}: {exc}",
++                    tuple(transcript),
++                ) from exc
++
++            turn_text = "".join(turn_parts)
++            serialized_calls = (
++                [tool_call.to_api_dict() for tool_call in tool_calls]
++                if tool_calls
++                else None
++            )
++            assistant_message = ChatMessage(
++                role="assistant",
++                content=turn_text,
++                tool_calls=serialized_calls,
++            )
++            messages.append(assistant_message)
++            transcript.append(assistant_message.to_api_dict())
++            if not tool_calls:
++                if (
++                    not turn_text.strip()
++                    and executed_calls
++                    and empty_result_retries == 0
++                ):
++                    empty_result_retries += 1
++                    retry_message = ChatMessage(
++                        role="system",
++                        content=(
++                            "上一轮没有输出最终文本。请直接基于已有工具结果"
++                            "完成 current_step，给出明确的最终结果；不要返回空内容。"
++                        ),
++                    )
++                    messages.append(retry_message)
++                    transcript.append(retry_message.to_api_dict())
++                    yield StepTranscriptUpdate(
++                        transcript=tuple(deepcopy(transcript)),
++                    )
++                    continue
++                break
++
++            # Persist the model's tool-call intent before executing the tool.
++            # This closes the cancellation window around long-running tools.
++            yield StepTranscriptUpdate(
++                transcript=tuple(deepcopy(transcript)),
++            )
++
++            if tool_rounds >= self.max_tool_rounds:
++                error = f"工具调用轮数超过限制（{self.max_tool_rounds}）"
++                for tool_call in tool_calls:
++                    tool_call.result = error
++                    tool_message = self._append_tool_result(messages, tool_call)
++                    transcript.append(tool_message.to_api_dict())
++                    yield StepToolExecution(
++                        tool_call=tool_call,
++                        transcript=tuple(deepcopy(transcript)),
++                    )
++                raise StepExecutionError(error, tuple(transcript))
++
++            tool_rounds += 1
++            for tool_call in tool_calls:
++                tool_call.result = await self._execute_tool_call(tool_call)
++                executed_calls.append(tool_call)
++                tool_message = self._append_tool_result(messages, tool_call)
++                transcript.append(tool_message.to_api_dict())
++                yield StepToolExecution(
++                    tool_call=tool_call,
++                    transcript=tuple(deepcopy(transcript)),
++                )
++
++        output = turn_text.strip()
++        if not output:
++            yield StepExecution(
++                result=StepResult(
++                    success=False,
++                    output="",
++                    error="步骤未产出结果",
++                ),
++                tool_calls=tuple(executed_calls),
++                transcript=tuple(deepcopy(transcript)),
++            )
++            return
++        yield StepExecution(
++            result=StepResult(success=True, output=output),
++            tool_calls=tuple(executed_calls),
++            transcript=tuple(deepcopy(transcript)),
++        )
++
++    @staticmethod
++    def _inject_step_context(
++        messages: list[ChatMessage],
++        task: AgentTask,
++        step: PlanStep,
++        dependency_results: dict[str, StepResult],
++        retry_feedback: str | None = None,
++    ) -> None:
++        payload = {
++            "task_goal": task.goal,
++            "task_input": task.input,
++            "current_step": {
++                "id": step.id,
++                "description": step.description,
++                "success_criteria": step.success_criteria,
++            },
++            "dependencies": {
++                step_id: StepExecutor._serialize_result(result)
++                for step_id, result in dependency_results.items()
++            },
++            "retry_feedback": retry_feedback,
++        }
++        step_message = ChatMessage(
++            role="system",
++            content=(
++                "你正在执行计划中的一个步骤。只完成 current_step，并产出可供后续"
++                "步骤使用的明确结果；可以使用提供的工具。\n"
++                f"{json.dumps(payload, ensure_ascii=False, default=repr)}"
++            ),
++        )
++        insertion_index = next(
++            (
++                index
++                for index, message in enumerate(messages)
++                if message.role != "system"
++            ),
++            len(messages),
++        )
++        messages.insert(insertion_index, step_message)
++
++    @staticmethod
++    def _serialize_result(result: StepResult) -> dict[str, Any]:
++        return {
++            "success": result.success,
++            "output": result.output,
++            "evidence": list(result.evidence),
++            "artifacts": [
++                StepExecutor._serialize_artifact(artifact)
++                for artifact in result.artifacts
++            ],
++            "error": result.error,
++        }
++
++    @staticmethod
++    def _serialize_artifact(artifact: ArtifactRef) -> dict[str, str]:
++        return {"uri": artifact.uri, "kind": artifact.kind}
++
++    @staticmethod
++    def _append_tool_result(
++        messages: list[ChatMessage],
++        tool_call: ToolCall,
++    ) -> ChatMessage:
++        message = ChatMessage(
++            role="tool",
++            content=tool_call.result,
++            tool_call_id=tool_call.call_id,
++        )
++        messages.append(message)
++        return message
++
++    async def _execute_tool_call(self, tool_call: ToolCall) -> str:
++        if self.tool_executor is None:
++            return "工具执行失败：未配置工具执行器"
++        try:
++            arguments = json.loads(tool_call.arguments or "{}")
++        except json.JSONDecodeError as exc:
++            return f"工具参数不是有效 JSON：{exc}"
++
++        try:
++            if inspect.iscoroutinefunction(self.tool_executor):
++                result = await self.tool_executor(tool_call.name, arguments)
++            else:
++                result = await asyncio.to_thread(
++                    self.tool_executor,
++                    tool_call.name,
++                    arguments,
++                )
++            if inspect.isawaitable(result):
++                result = await result
++            return str(result)
++        except Exception as exc:  # noqa: BLE001
++            return f"工具执行失败：{type(exc).__name__}: {exc}"
++
++
++__all__ = [
++    "StepExecution",
++    "StepExecutionError",
++    "StepExecutor",
++    "StepModel",
++    "StepToolExecution",
++    "StepTranscriptUpdate",
++    "ToolExecutor",
++]
+diff --git a/sparkos/agent/task.py b/sparkos/agent/task.py
+index fd689c7..ffddf98 100644
+--- a/sparkos/agent/task.py
++++ b/sparkos/agent/task.py
+@@ -14,7 +14,9 @@ from typing import Any
+ 
+ class TaskStatus(StrEnum):
+     PENDING = "pending"
++    PLANNING = "planning"
+     RUNNING = "running"
++    WAITING_INPUT = "waiting_input"
+     SUCCEEDED = "succeeded"
+     FAILED = "failed"
+     CANCELLED = "cancelled"
+@@ -33,6 +35,10 @@ class AgentTask:
+     result: str | None = None
+     error: str | None = None
+ 
++    def start_planning(self) -> None:
++        self.status = TaskStatus.PLANNING
++        self.error = None
++
+     def start(self) -> None:
+         self.status = TaskStatus.RUNNING
+         self.error = None
+diff --git a/sparkos/agent/task_store.py b/sparkos/agent/task_store.py
+new file mode 100644
+index 0000000..1b38d6d
+--- /dev/null
++++ b/sparkos/agent/task_store.py
+@@ -0,0 +1,21 @@
++"""Persistence port for task execution snapshots."""
++
++from __future__ import annotations
++
++from typing import Protocol
++
++from sparkos.agent.planner import Plan
++from sparkos.agent.step import StepRun
++from sparkos.agent.task import AgentTask
++
++
++class TaskStore(Protocol):
++    def save(
++        self,
++        task: AgentTask,
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++    ) -> None: ...
++
++
++__all__ = ["TaskStore"]
+diff --git a/sparkos/agent/verifier.py b/sparkos/agent/verifier.py
+new file mode 100644
+index 0000000..b3e28b4
+--- /dev/null
++++ b/sparkos/agent/verifier.py
+@@ -0,0 +1,147 @@
++"""Structured verification of candidate Step results."""
++
++from __future__ import annotations
++
++import json
++from typing import Any, Protocol
++
++from sparkos.agent.planner import PlanStep
++from sparkos.agent.step import StepResult, StepVerification
++from sparkos.agent.task import AgentTask
++
++_VERIFIER_PROMPT = """你是 Agent 步骤结果验证器。只判断 candidate_result 是否满足 step.success_criteria，不要执行任务或调用工具。
++
++只输出一个 JSON 对象：
++{
++  "passed": false,
++  "reason": "不满足成功标准的具体原因",
++  "retryable": true,
++  "evidence": ["候选结果中可验证的事实"]
++}
++
++规则：
++- candidate_result 非空不等于通过；必须逐项对照 success_criteria。
++- 候选结果自述“无法完成”、“稍后继续”或只描述过程时，应判定为不通过。
++- 补充或重新执行当前步骤可能修复时 retryable=true；外部前置条件不可用时为 false。
++- evidence 只放 candidate_result 中已经出现的事实。
++""".strip()
++
++
++class VerificationModel(Protocol):
++    async def chat_once(self, messages: list[dict]) -> str: ...
++
++
++class StepVerifier(Protocol):
++    async def verify(
++        self,
++        task: AgentTask,
++        step: PlanStep,
++        result: StepResult,
++        dependency_results: dict[str, StepResult],
++    ) -> StepVerification: ...
++
++
++class LLMStepVerifier:
++    def __init__(self, model: VerificationModel) -> None:
++        self.model = model
++
++    async def verify(
++        self,
++        task: AgentTask,
++        step: PlanStep,
++        result: StepResult,
++        dependency_results: dict[str, StepResult],
++    ) -> StepVerification:
++        try:
++            response = await self.model.chat_once(
++                self._build_request(
++                    task,
++                    step,
++                    result,
++                    dependency_results,
++                )
++            )
++            return self._parse_verification(response)
++        except Exception as exc:  # noqa: BLE001
++            return StepVerification(
++                passed=True,
++                reason="验证器不可用，按兼容策略放行",
++                retryable=False,
++                error=f"{type(exc).__name__}: {exc}",
++            )
++
++    @staticmethod
++    def _build_request(
++        task: AgentTask,
++        step: PlanStep,
++        result: StepResult,
++        dependency_results: dict[str, StepResult],
++    ) -> list[dict[str, str]]:
++        payload = {
++            "task": {"goal": task.goal, "input": task.input},
++            "step": {
++                "id": step.id,
++                "description": step.description,
++                "success_criteria": step.success_criteria,
++            },
++            "candidate_result": LLMStepVerifier._serialize_result(result),
++            "dependency_results": {
++                step_id: LLMStepVerifier._serialize_result(dependency)
++                for step_id, dependency in dependency_results.items()
++            },
++        }
++        return [
++            {"role": "system", "content": _VERIFIER_PROMPT},
++            {
++                "role": "user",
++                "content": json.dumps(
++                    payload,
++                    ensure_ascii=False,
++                    default=repr,
++                ),
++            },
++        ]
++
++    @staticmethod
++    def _parse_verification(response: str) -> StepVerification:
++        text = response.strip()
++        payload = json.loads(text)
++
++        if not isinstance(payload, dict):
++            raise TypeError("验证器输出必须是 JSON 对象")
++        passed = payload.get("passed")
++        reason = payload.get("reason")
++        retryable = payload.get("retryable")
++        evidence = payload.get("evidence", [])
++        if not isinstance(passed, bool):
++            raise TypeError("passed 必须是布尔值")
++        if not isinstance(reason, str) or not reason.strip():
++            raise TypeError("reason 必须是非空字符串")
++        if not isinstance(retryable, bool):
++            raise TypeError("retryable 必须是布尔值")
++        if not isinstance(evidence, list) or not all(
++            isinstance(item, str) and item.strip() for item in evidence
++        ):
++            raise TypeError("evidence 必须是字符串数组")
++        return StepVerification(
++            passed=passed,
++            reason=reason.strip(),
++            retryable=retryable,
++            evidence=tuple(item.strip() for item in evidence),
++        )
++
++    @staticmethod
++    def _serialize_result(result: StepResult) -> dict[str, Any]:
++        return {
++            "success": result.success,
++            "output": result.output,
++            "evidence": list(result.evidence),
++            "artifacts": [
++                {"uri": artifact.uri, "kind": artifact.kind}
++                for artifact in result.artifacts
++            ],
++            "error": result.error,
++        }
++
++
++__all__ = ["LLMStepVerifier", "StepVerifier", "VerificationModel"]
+diff --git a/sparkos/infrastructure/persistence/__init__.py b/sparkos/infrastructure/persistence/__init__.py
+new file mode 100644
+index 0000000..32cdb9f
+--- /dev/null
++++ b/sparkos/infrastructure/persistence/__init__.py
+@@ -0,0 +1 @@
++"""Persistence adapters."""
+diff --git a/sparkos/infrastructure/persistence/task_store.py b/sparkos/infrastructure/persistence/task_store.py
+new file mode 100644
+index 0000000..fe59f9c
+--- /dev/null
++++ b/sparkos/infrastructure/persistence/task_store.py
+@@ -0,0 +1,158 @@
++"""Atomic JSON persistence for task execution snapshots."""
++
++from __future__ import annotations
++
++import json
++import re
++import uuid
++from datetime import UTC, datetime
++from pathlib import Path
++from typing import Any
++
++from sparkos.agent.planner import Plan, PlanStep
++from sparkos.agent.step import (
++    ArtifactRef,
++    StepResult,
++    StepRun,
++    StepVerification,
++)
++from sparkos.agent.task import AgentTask
++
++TASKS_DIR = Path(__file__).resolve().parents[3] / ".sparkmind" / "tasks"
++_SAFE_TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
++
++
++class JsonTaskStore:
++    def __init__(self, root: Path | str = TASKS_DIR) -> None:
++        self.root = Path(root)
++
++    def save(
++        self,
++        task: AgentTask,
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++    ) -> None:
++        if _SAFE_TASK_ID.fullmatch(task.id) is None:
++            raise ValueError("task id 只能包含字母、数字、点、下划线和连字符")
++        self.root.mkdir(parents=True, exist_ok=True)
++        target = self.root / f"{task.id}.json"
++        temporary = self.root / f".{task.id}.{uuid.uuid4().hex}.tmp"
++        serialized_plan = self._serialize_plan(plan)
++        plan_history: list[dict[str, Any]] = []
++        if target.is_file():
++            previous = json.loads(target.read_text(encoding="utf-8"))
++            plan_history = list(previous.get("plan_history", []))
++            previous_plan = previous.get("plan")
++            if isinstance(previous_plan, dict) and previous_plan != serialized_plan:
++                plan_history.append(
++                    {
++                        "archived_at": previous.get("saved_at"),
++                        "plan": previous_plan,
++                        "step_runs": previous.get("step_runs", {}),
++                    }
++                )
++        payload = {
++            "saved_at": datetime.now(UTC).isoformat(),
++            "task": self._serialize_task(task),
++            "plan": serialized_plan,
++            "step_runs": {
++                step_id: self._serialize_step_run(run)
++                for step_id, run in step_runs.items()
++            },
++            "plan_history": plan_history,
++        }
++        try:
++            temporary.write_text(
++                json.dumps(payload, ensure_ascii=False, indent=2, default=repr),
++                encoding="utf-8",
++            )
++            temporary.replace(target)
++        finally:
++            if temporary.exists():
++                temporary.unlink()
++
++    @staticmethod
++    def _serialize_task(task: AgentTask) -> dict[str, Any]:
++        return {
++            "id": task.id,
++            "goal": task.goal,
++            "input": task.input,
++            "status": task.status.value,
++            "parent_task_id": task.parent_task_id,
++            "active_plan_id": task.active_plan_id,
++            "result": task.result,
++            "error": task.error,
++        }
++
++    @classmethod
++    def _serialize_plan(cls, plan: Plan) -> dict[str, Any]:
++        return {
++            "id": plan.id,
++            "task_id": plan.task_id,
++            "version": plan.version,
++            "source": plan.source,
++            "steps": [cls._serialize_plan_step(step) for step in plan.steps],
++        }
++
++    @staticmethod
++    def _serialize_plan_step(step: PlanStep) -> dict[str, Any]:
++        return {
++            "id": step.id,
++            "description": step.description,
++            "depends_on": list(step.depends_on),
++            "success_criteria": step.success_criteria,
++        }
++
++    @classmethod
++    def _serialize_step_run(cls, run: StepRun) -> dict[str, Any]:
++        return {
++            "step_id": run.step_id,
++            "status": run.status.value,
++            "attempt_count": run.attempt_count,
++            "result": cls._serialize_result(run.result) if run.result else None,
++            "error": run.error,
++            "transcript": run.transcript,
++            "verification": (
++                cls._serialize_verification(run.verification)
++                if run.verification
++                else None
++            ),
++            "verification_history": [
++                cls._serialize_verification(item) for item in run.verification_history
++            ],
++            "result_history": [
++                cls._serialize_result(item) for item in run.result_history
++            ],
++            "transcript_history": run.transcript_history,
++        }
++
++    @staticmethod
++    def _serialize_verification(
++        verification: StepVerification,
++    ) -> dict[str, Any]:
++        return {
++            "passed": verification.passed,
++            "reason": verification.reason,
++            "retryable": verification.retryable,
++            "evidence": list(verification.evidence),
++            "error": verification.error,
++        }
++
++    @classmethod
++    def _serialize_result(cls, result: StepResult) -> dict[str, Any]:
++        return {
++            "success": result.success,
++            "output": result.output,
++            "evidence": list(result.evidence),
++            "artifacts": [
++                cls._serialize_artifact(artifact) for artifact in result.artifacts
++            ],
++            "error": result.error,
++        }
++
++    @staticmethod
++    def _serialize_artifact(artifact: ArtifactRef) -> dict[str, str]:
++        return {"uri": artifact.uri, "kind": artifact.kind}
++
++
++__all__ = ["TASKS_DIR", "JsonTaskStore"]
+diff --git a/sparkos/ui/chat_app.py b/sparkos/ui/chat_app.py
+index 6ca73a4..21c0b79 100644
+--- a/sparkos/ui/chat_app.py
++++ b/sparkos/ui/chat_app.py
+@@ -12,10 +12,16 @@ from textual.widgets import Collapsible, Footer, Header, Input, Markdown, Static
+ 
+ from sparkos.agent.events import (
+     PlanCreated,
++    PlanReplanned,
++    StepCompleted,
++    StepFailed,
++    StepRetrying,
++    StepStarted,
++    StepToolCompleted,
++    StepVerificationCompleted,
+     TaskCompleted,
+     TaskFailed,
+     TextDelta,
+-    ToolCompleted,
+ )
+ from sparkos.agent.runtime import AgentRuntime
+ from sparkos.agent.skills.loader import load_skills, parse_slash_command
+@@ -93,7 +99,10 @@ class ChatApp(App):
+ 
+     def __init__(self) -> None:
+         super().__init__()
+-        self.runtime = AgentRuntime(enable_planning=True)
++        self.runtime = AgentRuntime(
++            enable_planning=True,
++            enable_verification=True,
++        )
+         self._generation_worker: object | None = None
+ 
+     def compose(self) -> ComposeResult:
+@@ -231,11 +240,29 @@ class ChatApp(App):
+                         received_text = True
+                         status.update("正在生成……")
+                     await markdown_stream.write(event.text)
+-                elif isinstance(event, ToolCompleted):
++                elif isinstance(event, StepToolCompleted):
+                     await self._show_tool_call(event.tool_call, chat)
+-                    status.update(f"工具: {event.tool_call.name}")
++                    status.update(f"步骤 {event.step.id} 工具: {event.tool_call.name}")
+                 elif isinstance(event, PlanCreated):
+                     status.update(f"已生成计划（{len(event.plan.steps)} 步）")
++                elif isinstance(event, PlanReplanned):
++                    status.update(
++                        f"已重新规划（v{event.plan.version}，"
++                        f"{len(event.plan.steps)} 步）"
++                    )
++                elif isinstance(event, StepStarted):
++                    status.update(f"正在执行: {event.step.description}")
++                elif isinstance(event, StepCompleted):
++                    status.update(f"步骤完成: {event.step.description}")
++                elif isinstance(event, StepVerificationCompleted):
++                    state = "通过" if event.verification.passed else "未通过"
++                    status.update(f"步骤验证{state}: {event.step.description}")
++                elif isinstance(event, StepRetrying):
++                    status.update(
++                        f"重试步骤（第 {event.attempt} 次）: {event.step.description}"
++                    )
++                elif isinstance(event, StepFailed):
++                    status.update(f"步骤失败: {event.step.description}")
+                 elif isinstance(event, TaskCompleted):
+                     status.update("生成完成")
+                 elif isinstance(event, TaskFailed):
+@@ -250,7 +277,7 @@ class ChatApp(App):
+             traceback.print_exc()
+             await markdown_stream.write(
+                 f"\n\n**请求失败：** `{type(exc).__name__}`: {exc}\n\n"
+-                "请检查网络、API Key 或模型配置。"
++                "请重试；如果持续失败，请查看 Task 快照或模型服务日志。"
+             )
+             status.update("请求失败")
+             raise
+diff --git a/tests/test_agent_models.py b/tests/test_agent_models.py
+index ee4d24a..92ca112 100644
+--- a/tests/test_agent_models.py
++++ b/tests/test_agent_models.py
+@@ -1,9 +1,18 @@
+ from __future__ import annotations
+ 
+ import unittest
++from dataclasses import FrozenInstanceError
+ 
+ from sparkos.agent.events import TaskCompleted, TextDelta, ToolCompleted
+-from sparkos.agent.planner import Plan, PlanStep, PlanStepStatus
++from sparkos.agent.planner import Plan, PlanStep
++from sparkos.agent.retry import RetryPolicy
++from sparkos.agent.step import (
++    ArtifactRef,
++    StepResult,
++    StepRun,
++    StepStatus,
++    StepVerification,
++)
+ from sparkos.agent.task import AgentTask, TaskStatus
+ from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
+ 
+@@ -45,6 +54,13 @@ class ChatModelTests(unittest.TestCase):
+ 
+ 
+ class AgentTaskTests(unittest.TestCase):
++    def test_task_can_enter_planning_state(self) -> None:
++        task = AgentTask(goal="analyze")
++
++        task.start_planning()
++
++        self.assertEqual(task.status, TaskStatus.PLANNING)
++
+     def test_task_lifecycle_records_result(self) -> None:
+         task = AgentTask(goal="analyze")
+ 
+@@ -66,12 +82,119 @@ class AgentTaskTests(unittest.TestCase):
+ 
+ 
+ class PlanningModelTests(unittest.TestCase):
+-    def test_plan_has_versioned_steps(self) -> None:
+-        step = PlanStep(description="read input")
+-        plan = Plan(task_id="task-1", steps=[step], version=2)
++    def test_plan_definition_is_immutable_and_has_success_criteria(self) -> None:
++        step = PlanStep(
++            id="s1",
++            description="read input",
++            depends_on=(),
++            success_criteria="input is available",
++        )
++        plan = Plan(task_id="task-1", steps=(step,), version=2)
+ 
+         self.assertEqual(plan.version, 2)
+-        self.assertEqual(plan.steps[0].status, PlanStepStatus.PENDING)
++        self.assertEqual(plan.steps[0].success_criteria, "input is available")
++        self.assertFalse(hasattr(step, "status"))
++        with self.assertRaises(FrozenInstanceError):
++            step.description = "changed"  # type: ignore[misc]
++
++    def test_plan_rejects_duplicate_ids_and_dependency_cycles(self) -> None:
++        duplicate = PlanStep(id="same", description="one")
++        with self.assertRaisesRegex(ValueError, "重复"):
++            Plan(task_id="task-1", steps=(duplicate, duplicate))
++
++        with self.assertRaisesRegex(ValueError, "环"):
++            Plan(
++                task_id="task-1",
++                steps=(
++                    PlanStep(id="s1", description="one", depends_on=("s2",)),
++                    PlanStep(id="s2", description="two", depends_on=("s1",)),
++                ),
++            )
++
++
++class StepRunTests(unittest.TestCase):
++    def test_step_run_owns_execution_state_and_result(self) -> None:
++        result = StepResult(
++            success=True,
++            output="loaded",
++            evidence=("120 rows",),
++            artifacts=(ArtifactRef(uri="file:///tmp/data.csv", kind="file"),),
++        )
++        run = StepRun(step_id="s1")
++
++        run.start()
++        run.succeed(result)
++
++        self.assertEqual(run.status, StepStatus.SUCCEEDED)
++        self.assertEqual(run.attempt_count, 1)
++        self.assertIs(run.result, result)
++        self.assertIsNone(run.error)
++
++    def test_step_run_records_failure_and_blocking(self) -> None:
++        failed = StepRun(step_id="s1")
++        blocked = StepRun(step_id="s2")
++
++        failed.start()
++        failed.fail("boom")
++        blocked.block("dependency failed")
++
++        self.assertEqual(failed.status, StepStatus.FAILED)
++        self.assertEqual(failed.error, "boom")
++        self.assertEqual(blocked.status, StepStatus.BLOCKED)
++
++    def test_step_run_records_transcript_and_cancellation(self) -> None:
++        run = StepRun(step_id="s1")
++        run.start()
++
++        run.record_transcript(
++            (
++                {"role": "assistant", "content": "reading"},
++                {
++                    "role": "tool",
++                    "content": "loaded",
++                    "tool_call_id": "c1",
++                },
++            )
++        )
++        run.cancel()
++
++        self.assertEqual(run.status, StepStatus.CANCELLED)
++        self.assertEqual(run.transcript[-1]["tool_call_id"], "c1")
++
++    def test_step_verification_rejection_can_prepare_one_retry(self) -> None:
++        run = StepRun(step_id="s1")
++        candidate = StepResult(success=True, output="weather unavailable")
++        verification = StepVerification(
++            passed=False,
++            reason="missing temperature",
++            retryable=True,
++        )
++        run.start()
++        run.record_transcript([{"role": "assistant", "content": candidate.output}])
++
++        run.begin_verification(candidate)
++        run.record_verification(verification)
++
++        self.assertEqual(run.status, StepStatus.VERIFYING)
++        self.assertTrue(RetryPolicy(max_attempts=2).should_retry(run, verification))
++
++        run.prepare_retry()
++
++        self.assertEqual(run.status, StepStatus.PENDING)
++        self.assertIsNone(run.result)
++        self.assertEqual(run.result_history, [candidate])
++        self.assertEqual(len(run.transcript_history), 1)
++        self.assertEqual(run.verification_history, [verification])
++
++    def test_retry_policy_stops_at_attempt_limit(self) -> None:
++        run = StepRun(step_id="s1", attempt_count=2)
++        verification = StepVerification(False, "still incomplete", True)
++
++        self.assertFalse(RetryPolicy(max_attempts=2).should_retry(run, verification))
++
++    def test_retry_policy_rejects_more_than_two_attempts(self) -> None:
++        with self.assertRaisesRegex(ValueError, "最多允许 2 次"):
++            RetryPolicy(max_attempts=3)
+ 
+ 
+ class EventModelTests(unittest.TestCase):
+diff --git a/tests/test_agent_runtime.py b/tests/test_agent_runtime.py
+index f310a20..0c1beaf 100644
+--- a/tests/test_agent_runtime.py
++++ b/tests/test_agent_runtime.py
+@@ -1,19 +1,30 @@
+ from __future__ import annotations
+ 
++import asyncio
+ import unittest
+ from collections.abc import AsyncIterator
++from pathlib import Path
+ from unittest.mock import Mock
+ 
+ from sparkos.agent.context import WINDOW, AgentContext
+ from sparkos.agent.events import (
+     PlanCreated,
++    PlanReplanned,
++    StepCompleted,
++    StepFailed,
++    StepRetrying,
++    StepStarted,
++    StepToolCompleted,
++    StepVerificationCompleted,
+     TaskCompleted,
++    TaskFailed,
+     TaskStarted,
+     TextDelta,
+-    ToolCompleted,
+ )
+ from sparkos.agent.planner import Plan, PlanStep
+ from sparkos.agent.runtime import AgentRuntime
++from sparkos.agent.skills.loader import Skill
++from sparkos.agent.step import StepRun, StepStatus, StepVerification
+ from sparkos.agent.task import AgentTask, TaskStatus
+ from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
+ 
+@@ -45,12 +56,163 @@ class FakeClient:
+ 
+ 
+ class FakePlanner:
+-    def __init__(self) -> None:
++    def __init__(self, plan: Plan) -> None:
++        self.plan = plan
+         self.calls: list[tuple[AgentTask, object]] = []
+ 
+     async def create_plan(self, task: AgentTask, context: object) -> Plan:
+         self.calls.append((task, context))
+-        return Plan(task_id=task.id, steps=[PlanStep(description="inspect")])
++        return Plan(
++            id=self.plan.id,
++            task_id=task.id,
++            steps=self.plan.steps,
++            version=self.plan.version,
++            source=self.plan.source,
++        )
++
++
++class FakeVerifier:
++    def __init__(self, responses: list[StepVerification]) -> None:
++        self.responses = list(responses)
++        self.calls: list[tuple[AgentTask, PlanStep, object, object]] = []
++
++    async def verify(
++        self,
++        task: AgentTask,
++        step: PlanStep,
++        result: object,
++        dependency_results: object,
++    ) -> StepVerification:
++        self.calls.append((task, step, result, dependency_results))
++        return self.responses.pop(0)
++
++
++class FakeReplanner:
++    def __init__(self, plan: Plan | None) -> None:
++        self.plan = plan
++        self.calls: list[dict] = []
++
++    async def revise_plan(
++        self,
++        task: AgentTask,
++        context: object,
++        current_plan: Plan,
++        step_runs: dict[str, StepRun],
++        failed_step: PlanStep,
++        reason: str,
++    ) -> Plan | None:
++        self.calls.append(
++            {
++                "task": task,
++                "context": context,
++                "current_plan": current_plan,
++                "step_runs": step_runs,
++                "failed_step": failed_step,
++                "reason": reason,
++            }
++        )
++        if self.plan is None:
++            return None
++        return Plan(
++            id=self.plan.id,
++            task_id=task.id,
++            version=self.plan.version,
++            source=self.plan.source,
++            steps=self.plan.steps,
++        )
++
++
++class FakeTaskStore:
++    def __init__(self) -> None:
++        self.snapshots: list[dict] = []
++
++    def save(
++        self,
++        task: AgentTask,
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++    ) -> None:
++        self.snapshots.append(
++            {
++                "task_status": task.status,
++                "task_result": task.result,
++                "plan_id": plan.id,
++                "step_statuses": {
++                    step_id: run.status for step_id, run in step_runs.items()
++                },
++                "attempt_counts": {
++                    step_id: run.attempt_count for step_id, run in step_runs.items()
++                },
++                "transcripts": {
++                    step_id: list(getattr(run, "transcript", []))
++                    for step_id, run in step_runs.items()
++                },
++            }
++        )
++
++
++class FailingTaskStore:
++    def save(
++        self,
++        task: AgentTask,
++        plan: Plan,
++        step_runs: dict[str, StepRun],
++    ) -> None:
++        del task, plan, step_runs
++        raise OSError("disk full")
++
++
++class BlockingClient(FakeClient):
++    def __init__(self) -> None:
++        super().__init__(turns=[])
++        self.started = asyncio.Event()
++
++    async def chat_stream(
++        self,
++        messages: list[ChatMessage],
++        tools: list[dict] | None = None,
++    ) -> AsyncIterator[str | ToolCall]:
++        del messages, tools
++        self.started.set()
++        await asyncio.Event().wait()
++        yield "unreachable"
++
++
++class BlockingVerifier:
++    def __init__(self) -> None:
++        self.started = asyncio.Event()
++
++    async def verify(
++        self,
++        task: AgentTask,
++        step: PlanStep,
++        result: object,
++        dependency_results: object,
++    ) -> StepVerification:
++        del task, step, result, dependency_results
++        self.started.set()
++        await asyncio.Event().wait()
++        return StepVerification(True, "unreachable", False)
++
++
++def two_step_plan(task_id: str = "placeholder") -> Plan:
++    return Plan(
++        id="plan-1",
++        task_id=task_id,
++        steps=(
++            PlanStep(
++                id="s1",
++                description="inspect input",
++                success_criteria="input inspected",
++            ),
++            PlanStep(
++                id="s2",
++                description="produce report",
++                depends_on=("s1",),
++                success_criteria="report produced",
++            ),
++        ),
++    )
+ 
+ 
+ def context_without_disk() -> AgentContext:
+@@ -65,18 +227,45 @@ async def collect_events(runtime: AgentRuntime, task: AgentTask) -> list[object]
+ 
+ 
+ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+-    async def test_no_tool_task_emits_lifecycle_and_text_events(self) -> None:
++    async def test_runtime_rejects_more_than_one_replan(self) -> None:
++        with self.assertRaisesRegex(ValueError, "最多允许 1 次"):
++            AgentRuntime(
++                context=context_without_disk(),
++                client=FakeClient(turns=[]),
++                skills=[],
++                tools=[],
++                max_replans=2,
++            )
++
++    async def test_simple_task_uses_direct_step_and_records_only_final_answer(
++        self,
++    ) -> None:
+         client = FakeClient(turns=[["hello", " world"]])
+         context = context_without_disk()
+-        runtime = AgentRuntime(context=context, client=client, skills=[], tools=[])
++        store = FakeTaskStore()
++        runtime = AgentRuntime(
++            context=context,
++            client=client,
++            skills=[],
++            tools=[],
++            task_store=store,
++        )
+         task = AgentTask(goal="answer")
+ 
+         events = await collect_events(runtime, task)
+ 
+         self.assertIsInstance(events[0], TaskStarted)
++        self.assertEqual(
++            [event.plan.source for event in events if isinstance(event, PlanCreated)],
++            ["direct"],
++        )
++        self.assertEqual(
++            [event.step.id for event in events if isinstance(event, StepStarted)],
++            ["direct"],
++        )
+         self.assertEqual(
+             [event.text for event in events if isinstance(event, TextDelta)],
+-            ["hello", " world"],
++            ["hello world"],
+         )
+         self.assertIsInstance(events[-1], TaskCompleted)
+         self.assertEqual(task.status, TaskStatus.SUCCEEDED)
+@@ -85,91 +274,591 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+             [message.role for message in context.history],
+             ["user", "assistant"],
+         )
++        self.assertEqual(context.history[-1].content, "hello world")
++        self.assertEqual(store.snapshots[-1]["task_status"], TaskStatus.SUCCEEDED)
+ 
+-    async def test_runtime_records_assistant_call_before_tool_result(self) -> None:
+-        call = ToolCall(call_id="c1", name="read_file", arguments="{}")
+-        client = FakeClient(turns=[[call], ["done"]])
+-        context = context_without_disk()
++    async def test_runtime_executes_plan_steps_in_dependency_order_and_synthesizes(
++        self,
++    ) -> None:
++        planner = FakePlanner(two_step_plan())
++        client = FakeClient(turns=[["inspected"], ["report data"], ["final answer"]])
++        store = FakeTaskStore()
+         runtime = AgentRuntime(
+-            context=context,
++            context=context_without_disk(),
+             client=client,
+-            skills=[],
++            planner=planner,
++            skills=[
++                Skill(
++                    name="spark-sql",
++                    description="Generate and optimize Spark SQL",
++                    path=Path("spark-sql/SKILL.md"),
++                )
++            ],
+             tools=[],
+-            tool_executor=lambda *_: "ok",
++            task_store=store,
+         )
++        task = AgentTask(goal="analyze")
+ 
+-        events = await collect_events(runtime, AgentTask(goal="work"))
++        events = await collect_events(runtime, task)
+ 
+         self.assertEqual(
+-            [message.role for message in context.history],
+-            ["user", "assistant", "tool", "assistant"],
++            [event.step.id for event in events if isinstance(event, StepStarted)],
++            ["s1", "s2"],
++        )
++        self.assertEqual(
++            [event.step.id for event in events if isinstance(event, StepCompleted)],
++            ["s1", "s2"],
++        )
++        self.assertEqual(
++            [event.text for event in events if isinstance(event, TextDelta)],
++            ["final answer"],
++        )
++        self.assertEqual(task.result, "final answer")
++        self.assertEqual(
++            [message.role for message in runtime.context.history],
++            ["user", "assistant"],
+         )
+-        self.assertEqual(context.history[1].tool_calls, [call.to_api_dict()])
+-        self.assertEqual(context.history[2].tool_call_id, "c1")
+-        self.assertEqual(context.history[2].content, "ok")
++        second_step_system = [
++            message["content"]
++            for message in client.requests[1]
++            if message["role"] == "system"
++        ][-1]
++        self.assertIn("inspected", second_step_system)
++        final_system = [
++            message["content"]
++            for message in client.requests[2]
++            if message["role"] == "system"
++        ][-1]
++        self.assertIn("report data", final_system)
++        self.assertGreaterEqual(len(store.snapshots), 6)
++        planning_snapshot = planner.calls[0][1]
++        self.assertEqual(planning_snapshot.skills[0].name, "spark-sql")
+         self.assertEqual(
++            planning_snapshot.skills[0].description,
++            "Generate and optimize Spark SQL",
++        )
++
++    async def test_final_synthesis_rejects_textual_tool_call_markup(self) -> None:
++        raw_tool_call = (
++            "<tool_call><tool_name>web_fetch</tool_name>"
++            "<parameter=url>https://wttr.in/Shanghai</parameter></tool_call>"
++        )
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[["inspected"], ["final report"], [raw_tool_call]]),
++            planner=FakePlanner(two_step_plan()),
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
++        task = AgentTask(goal="analyze")
++
++        events = await collect_events(runtime, task)
++
++        self.assertEqual(
++            [event.text for event in events if isinstance(event, TextDelta)],
++            ["final report"],
++        )
++        self.assertEqual(task.result, "final report")
++        self.assertNotIn("<tool_call>", runtime.context.history[-1].content)
++
++    async def test_verifier_rejection_retries_once_with_feedback(self) -> None:
++        verifier = FakeVerifier(
+             [
+-                event.tool_call.result
+-                for event in events
+-                if isinstance(event, ToolCompleted)
+-            ],
+-            ["ok"],
++                StepVerification(False, "missing temperature", True),
++                StepVerification(
++                    True,
++                    "criteria satisfied",
++                    False,
++                    evidence=("temperature 33C",),
++                ),
++            ]
+         )
+-        self.assertEqual(client.requests[1][-2]["tool_calls"], [call.to_api_dict()])
+-        self.assertEqual(client.requests[1][-1]["tool_call_id"], "c1")
++        store = FakeTaskStore()
++        client = FakeClient(turns=[["humidity only"], ["temperature 33C"]])
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=client,
++            verifier=verifier,
++            skills=[],
++            tools=[],
++            task_store=store,
++        )
++        task = AgentTask(goal="weather")
++
++        events = await collect_events(runtime, task)
++
++        self.assertEqual(task.result, "temperature 33C")
++        self.assertEqual(store.snapshots[-1]["attempt_counts"]["direct"], 2)
++        self.assertEqual(
++            len([event for event in events if isinstance(event, StepRetrying)]),
++            1,
++        )
++        self.assertEqual(
++            len(
++                [
++                    event
++                    for event in events
++                    if isinstance(event, StepVerificationCompleted)
++                ]
++            ),
++            2,
++        )
++        completed = next(event for event in events if isinstance(event, StepCompleted))
++        self.assertEqual(completed.result.evidence, ("temperature 33C",))
++        retry_system = [
++            message["content"]
++            for message in client.requests[1]
++            if message["role"] == "system"
++        ][-1]
++        self.assertIn("missing temperature", retry_system)
+ 
+-    async def test_runtime_invokes_optional_planner(self) -> None:
+-        planner = FakePlanner()
++    async def test_non_retryable_verification_rejection_fails_step(self) -> None:
+         runtime = AgentRuntime(
+             context=context_without_disk(),
+-            client=FakeClient(turns=[["done"]]),
+-            planner=planner,
++            client=FakeClient(turns=[["source unavailable"]]),
++            verifier=FakeVerifier(
++                [StepVerification(False, "source is blocked", False)]
++            ),
+             skills=[],
+             tools=[],
++            task_store=FakeTaskStore(),
++        )
++        task = AgentTask(goal="weather")
++        events: list[object] = []
++
++        with self.assertRaisesRegex(RuntimeError, "source is blocked"):
++            async for event in runtime.run(task):
++                events.append(event)
++
++        self.assertEqual(task.status, TaskStatus.FAILED)
++        self.assertEqual(
++            len([event for event in events if isinstance(event, StepRetrying)]),
++            0,
++        )
++        self.assertEqual(
++            len([event for event in events if isinstance(event, StepFailed)]),
++            1,
+         )
+-        task = AgentTask(goal="work")
++
++    async def test_verification_failure_replans_once_and_reuses_succeeded_step(
++        self,
++    ) -> None:
++        original = two_step_plan()
++        revised = Plan(
++            id="plan-2",
++            task_id="placeholder",
++            version=2,
++            source="replan",
++            steps=(
++                original.steps[0],
++                PlanStep(
++                    id="s3",
++                    description="produce fallback report",
++                    depends_on=("s1",),
++                    success_criteria="fallback report produced",
++                ),
++            ),
++        )
++        replanner = FakeReplanner(revised)
++        verifier = FakeVerifier(
++            [
++                StepVerification(True, "inspected", False),
++                StepVerification(False, "primary source incomplete", True),
++                StepVerification(False, "primary source still incomplete", True),
++                StepVerification(True, "fallback complete", False),
++            ]
++        )
++        client = FakeClient(
++            turns=[
++                ["inspected"],
++                ["bad report"],
++                ["still bad"],
++                ["fallback report"],
++                ["final answer"],
++            ]
++        )
++        store = FakeTaskStore()
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=client,
++            planner=FakePlanner(original),
++            replanner=replanner,
++            verifier=verifier,
++            skills=[],
++            tools=[],
++            task_store=store,
++        )
++        task = AgentTask(goal="analyze")
+ 
+         events = await collect_events(runtime, task)
+ 
+-        plan_events = [event for event in events if isinstance(event, PlanCreated)]
+-        self.assertEqual(len(planner.calls), 1)
+-        self.assertEqual(len(plan_events), 1)
+-        self.assertEqual(task.active_plan_id, plan_events[0].plan.id)
+-        request_contents = [
+-            message["content"] for message in runtime.client.requests[0]
++        self.assertEqual(task.status, TaskStatus.SUCCEEDED)
++        self.assertEqual(task.result, "final answer")
++        self.assertEqual(
++            [event.step.id for event in events if isinstance(event, StepStarted)],
++            ["s1", "s2", "s2", "s3"],
++        )
++        replan_events = [event for event in events if isinstance(event, PlanReplanned)]
++        self.assertEqual(len(replan_events), 1)
++        self.assertEqual(replan_events[0].previous_plan.id, "plan-1")
++        self.assertEqual(replan_events[0].plan.id, "plan-2")
++        self.assertEqual(len(replanner.calls), 1)
++        self.assertEqual(store.snapshots[-1]["plan_id"], "plan-2")
++
++    async def test_replan_can_rewrite_pending_downstream_dependencies(self) -> None:
++        original = Plan(
++            id="plan-1",
++            task_id="placeholder",
++            steps=(
++                PlanStep(
++                    id="s1",
++                    description="inspect inputs",
++                    success_criteria="inputs inspected",
++                ),
++                PlanStep(
++                    id="s2",
++                    description="load primary source",
++                    depends_on=("s1",),
++                    success_criteria="source loaded",
++                ),
++                PlanStep(
++                    id="s4",
++                    description="produce report",
++                    depends_on=("s2",),
++                    success_criteria="report produced",
++                ),
++            ),
++        )
++        revised = Plan(
++            id="plan-2",
++            task_id="placeholder",
++            version=2,
++            source="replan",
++            steps=(
++                original.steps[0],
++                PlanStep(
++                    id="s3",
++                    description="load fallback source",
++                    depends_on=("s1",),
++                    success_criteria="source loaded",
++                ),
++                PlanStep(
++                    id="s4",
++                    description="produce report",
++                    depends_on=("s3",),
++                    success_criteria="report produced",
++                ),
++            ),
++        )
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(
++                turns=[
++                    ["inspected"],
++                    ["bad source"],
++                    ["still bad"],
++                    ["fallback loaded"],
++                    ["report"],
++                    ["final answer"],
++                ]
++            ),
++            planner=FakePlanner(original),
++            replanner=FakeReplanner(revised),
++            verifier=FakeVerifier(
++                [
++                    StepVerification(True, "inspected", False),
++                    StepVerification(False, "primary unavailable", True),
++                    StepVerification(False, "primary still unavailable", True),
++                    StepVerification(True, "fallback loaded", False),
++                    StepVerification(True, "report produced", False),
++                ]
++            ),
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
++
++        events = await collect_events(runtime, AgentTask(goal="analyze"))
++
++        self.assertEqual(
++            [event.step.id for event in events if isinstance(event, StepStarted)],
++            ["s1", "s2", "s2", "s3", "s4"],
++        )
++        self.assertEqual(
++            len([event for event in events if isinstance(event, PlanReplanned)]),
++            1,
++        )
++
++    async def test_runtime_never_replans_more_than_once(self) -> None:
++        replanner = FakeReplanner(
++            Plan(
++                id="plan-2",
++                task_id="placeholder",
++                version=2,
++                source="replan",
++                steps=(
++                    PlanStep(
++                        id="fallback",
++                        description="fallback",
++                        success_criteria="fallback succeeds",
++                    ),
++                ),
++            )
++        )
++        verifier = FakeVerifier(
++            [
++                StepVerification(False, "first incomplete", True),
++                StepVerification(False, "first still incomplete", True),
++                StepVerification(False, "fallback incomplete", True),
++                StepVerification(False, "fallback still incomplete", True),
++            ]
++        )
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[["bad 1"], ["bad 2"], ["bad 3"], ["bad 4"]]),
++            replanner=replanner,
++            verifier=verifier,
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
++
++        with self.assertRaisesRegex(RuntimeError, "fallback still incomplete"):
++            await collect_events(runtime, AgentTask(goal="work"))
++
++        self.assertEqual(len(replanner.calls), 1)
++
++    async def test_runtime_rejects_revised_plan_without_replan_source(self) -> None:
++        replanner = FakeReplanner(
++            Plan(
++                id="plan-2",
++                task_id="placeholder",
++                version=2,
++                source="llm",
++                steps=(
++                    PlanStep(
++                        id="fallback",
++                        description="fallback",
++                        success_criteria="fallback succeeds",
++                    ),
++                ),
++            )
++        )
++        verifier = FakeVerifier(
++            [
++                StepVerification(False, "incomplete", True),
++                StepVerification(False, "still incomplete", True),
++                StepVerification(True, "fallback complete", False),
++            ]
++        )
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[["bad 1"], ["bad 2"], ["fallback"]]),
++            replanner=replanner,
++            verifier=verifier,
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
++        events: list[object] = []
++
++        with self.assertRaisesRegex(RuntimeError, "still incomplete"):
++            async for event in runtime.run(AgentTask(goal="work")):
++                events.append(event)
++
++        self.assertEqual(len(replanner.calls), 1)
++        self.assertFalse(any(isinstance(event, PlanReplanned) for event in events))
++
++    async def test_runtime_rejects_replan_that_resets_failed_step_attempts(
++        self,
++    ) -> None:
++        original = Plan(
++            id="plan-1",
++            task_id="placeholder",
++            steps=(
++                PlanStep(
++                    id="s1",
++                    description="load primary source",
++                    success_criteria="source loaded",
++                ),
++            ),
++        )
++        replanner = FakeReplanner(
++            Plan(
++                id="plan-2",
++                task_id="placeholder",
++                version=2,
++                source="replan",
++                steps=original.steps,
++            )
++        )
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[["bad 1"], ["bad 2"], ["bad 3"], ["final"]]),
++            planner=FakePlanner(original),
++            replanner=replanner,
++            verifier=FakeVerifier(
++                [
++                    StepVerification(False, "incomplete", True),
++                    StepVerification(False, "still incomplete", True),
++                    StepVerification(True, "unexpected third attempt", False),
++                ]
++            ),
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
++        events: list[object] = []
++
++        with self.assertRaisesRegex(RuntimeError, "still incomplete"):
++            async for event in runtime.run(AgentTask(goal="work")):
++                events.append(event)
++
++        starts = [event for event in events if isinstance(event, StepStarted)]
++        self.assertEqual(len(starts), 2)
++        self.assertFalse(any(isinstance(event, PlanReplanned) for event in events))
++
++    async def test_runtime_rejects_replan_that_reuses_plan_id(self) -> None:
++        original = Plan(
++            id="plan-1",
++            task_id="placeholder",
++            steps=(
++                PlanStep(
++                    id="s1",
++                    description="load primary source",
++                    success_criteria="source loaded",
++                ),
++            ),
++        )
++        replanner = FakeReplanner(
++            Plan(
++                id="plan-1",
++                task_id="placeholder",
++                version=2,
++                source="replan",
++                steps=(
++                    PlanStep(
++                        id="fallback",
++                        description="load fallback source",
++                        success_criteria="source loaded",
++                    ),
++                ),
++            )
++        )
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[["bad 1"], ["bad 2"], ["fallback"], ["final"]]),
++            planner=FakePlanner(original),
++            replanner=replanner,
++            verifier=FakeVerifier(
++                [
++                    StepVerification(False, "incomplete", True),
++                    StepVerification(False, "still incomplete", True),
++                    StepVerification(True, "fallback complete", False),
++                ]
++            ),
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
++
++        with self.assertRaisesRegex(RuntimeError, "still incomplete"):
++            await collect_events(runtime, AgentTask(goal="work"))
++
++    async def test_step_tool_calls_emit_scoped_events_not_session_messages(
++        self,
++    ) -> None:
++        call = ToolCall(call_id="c1", name="read_file", arguments="{}")
++        client = FakeClient(turns=[[call], ["done"]])
++        context = context_without_disk()
++        store = FakeTaskStore()
++        runtime = AgentRuntime(
++            context=context,
++            client=client,
++            skills=[],
++            tools=[],
++            tool_executor=lambda *_: "file contents",
++            task_store=store,
++        )
++
++        events = await collect_events(runtime, AgentTask(goal="work"))
++
++        tool_events = [
++            event for event in events if isinstance(event, StepToolCompleted)
+         ]
++        self.assertEqual(len(tool_events), 1)
++        self.assertEqual(tool_events[0].step.id, "direct")
++        self.assertEqual(tool_events[0].tool_call.result, "file contents")
++        self.assertEqual(
++            [message.role for message in context.history],
++            ["user", "assistant"],
++        )
+         self.assertTrue(
+-            any("inspect" in content for content in request_contents),
+-            "created plan must guide the executor model",
++            any(
++                snapshot["transcripts"]["direct"]
++                and snapshot["transcripts"]["direct"][-1].get("tool_call_id") == "c1"
++                for snapshot in store.snapshots
++            )
+         )
+ 
+-    async def test_runtime_compacts_before_building_model_context(self) -> None:
++    async def test_runtime_compacts_before_step_execution(self) -> None:
+         context = context_without_disk()
+         for index in range(WINDOW + 1):
+             context.record_user(str(index))
+         client = FakeClient(turns=[["done"]], summary="earlier turns")
+-        runtime = AgentRuntime(context=context, client=client, skills=[], tools=[])
++        runtime = AgentRuntime(
++            context=context,
++            client=client,
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
+ 
+         await collect_events(runtime, AgentTask(goal="new task"))
+ 
+         self.assertEqual(context.summary, "earlier turns")
+         self.assertEqual(context.summary_upto, 2)
+         request_contents = [item["content"] for item in client.requests[0]]
+-        self.assertFalse("0" in request_contents)
+-        self.assertFalse("1" in request_contents)
++        self.assertNotIn("0", request_contents)
++        self.assertNotIn("1", request_contents)
+         self.assertTrue(any("earlier turns" in item for item in request_contents))
+ 
+-    async def test_runtime_limits_tool_rounds_and_keeps_transcript_valid(self) -> None:
++    async def test_failed_step_marks_task_failed_and_emits_step_failure(self) -> None:
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[[]]),
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
++        task = AgentTask(goal="work")
++        captured: list[object] = []
++
++        with self.assertRaisesRegex(RuntimeError, "步骤未产出结果"):
++            async for event in runtime.run(task):
++                captured.append(event)
++
++        self.assertEqual(task.status, TaskStatus.FAILED)
++        self.assertEqual(
++            [event.step.id for event in captured if isinstance(event, StepFailed)],
++            ["direct"],
++        )
++        self.assertEqual(
++            [message.role for message in runtime.context.history], ["user"]
++        )
++
++    async def test_runtime_limits_tool_rounds_inside_step(self) -> None:
+         first = ToolCall(call_id="c1", name="shell", arguments="{}")
+         second = ToolCall(call_id="c2", name="shell", arguments="{}")
+-        context = context_without_disk()
+         runtime = AgentRuntime(
+-            context=context,
++            context=context_without_disk(),
+             client=FakeClient(turns=[[first], [second]]),
+             skills=[],
+             tools=[],
+             tool_executor=lambda *_: "ok",
+             max_tool_rounds=1,
++            task_store=FakeTaskStore(),
+         )
+         task = AgentTask(goal="loop")
+ 
+@@ -177,9 +866,165 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+             await collect_events(runtime, task)
+ 
+         self.assertEqual(task.status, TaskStatus.FAILED)
+-        self.assertEqual(context.history[-2].role, "assistant")
+-        self.assertEqual(context.history[-1].role, "tool")
+-        self.assertEqual(context.history[-1].tool_call_id, "c2")
++        self.assertEqual(
++            [message.role for message in runtime.context.history], ["user"]
++        )
++
++    async def test_cancelling_task_cancels_running_step_snapshot(self) -> None:
++        client = BlockingClient()
++        store = FakeTaskStore()
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=client,
++            skills=[],
++            tools=[],
++            task_store=store,
++        )
++        task = AgentTask(goal="wait")
++
++        async def drain() -> None:
++            async for _ in runtime.run(task):
++                pass
++
++        execution = asyncio.create_task(drain())
++        await client.started.wait()
++        execution.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await execution
++
++        self.assertEqual(task.status, TaskStatus.CANCELLED)
++        self.assertEqual(
++            store.snapshots[-1]["step_statuses"]["direct"],
++            StepStatus.CANCELLED,
++        )
++
++    async def test_closing_event_stream_cancels_verifying_step_snapshot(self) -> None:
++        task = AgentTask(goal="verify")
++        store = FakeTaskStore()
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[["candidate"]]),
++            verifier=FakeVerifier(
++                [StepVerification(True, "criteria satisfied", False)]
++            ),
++            skills=[],
++            tools=[],
++            task_store=store,
++        )
++        stream = runtime.run(task)
++
++        async for event in stream:
++            if isinstance(event, StepVerificationCompleted):
++                break
++        await stream.aclose()
++
++        self.assertEqual(task.status, TaskStatus.CANCELLED)
++        self.assertEqual(
++            store.snapshots[-1]["step_statuses"]["direct"],
++            StepStatus.CANCELLED,
++        )
++
++    async def test_closing_event_stream_after_task_started_cancels_task(self) -> None:
++        task = AgentTask(goal="start")
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[]),
++            skills=[],
++            tools=[],
++            task_store=FakeTaskStore(),
++        )
++        stream = runtime.run(task)
++
++        event = await anext(stream)
++        self.assertIsInstance(event, TaskStarted)
++        await stream.aclose()
++
++        self.assertEqual(task.status, TaskStatus.CANCELLED)
++
++    async def test_cancelling_verifier_call_cancels_verifying_step_snapshot(
++        self,
++    ) -> None:
++        task = AgentTask(goal="verify")
++        store = FakeTaskStore()
++        verifier = BlockingVerifier()
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[["candidate"]]),
++            verifier=verifier,
++            skills=[],
++            tools=[],
++            task_store=store,
++        )
++
++        async def drain() -> None:
++            async for _ in runtime.run(task):
++                pass
++
++        execution = asyncio.create_task(drain())
++        await verifier.started.wait()
++        execution.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await execution
++
++        self.assertEqual(task.status, TaskStatus.CANCELLED)
++        self.assertEqual(
++            store.snapshots[-1]["step_statuses"]["direct"],
++            StepStatus.CANCELLED,
++        )
++
++    async def test_cancelling_blocked_tool_preserves_started_call_transcript(
++        self,
++    ) -> None:
++        call = ToolCall(call_id="c1", name="slow_tool", arguments="{}")
++        client = FakeClient(turns=[[call]])
++        store = FakeTaskStore()
++        tool_started = asyncio.Event()
++
++        async def blocking_tool(name: str, arguments: dict) -> str:
++            del name, arguments
++            tool_started.set()
++            await asyncio.Event().wait()
++            return "unreachable"
++
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=client,
++            skills=[],
++            tools=[],
++            tool_executor=blocking_tool,
++            task_store=store,
++        )
++
++        async def drain() -> None:
++            async for _ in runtime.run(AgentTask(goal="wait for tool")):
++                pass
++
++        execution = asyncio.create_task(drain())
++        await tool_started.wait()
++        execution.cancel()
++        with self.assertRaises(asyncio.CancelledError):
++            await execution
++
++        final_transcript = store.snapshots[-1]["transcripts"]["direct"]
++        self.assertEqual(final_transcript[-1]["tool_calls"][0]["id"], "c1")
++
++    async def test_snapshot_failure_preserves_error_and_emits_task_failed(self) -> None:
++        runtime = AgentRuntime(
++            context=context_without_disk(),
++            client=FakeClient(turns=[]),
++            skills=[],
++            tools=[],
++            task_store=FailingTaskStore(),
++        )
++        task = AgentTask(goal="work")
++        events: list[object] = []
++
++        with self.assertRaisesRegex(OSError, "disk full"):
++            async for event in runtime.run(task):
++                events.append(event)
++
++        self.assertEqual(task.status, TaskStatus.FAILED)
++        self.assertTrue(any(isinstance(event, TaskFailed) for event in events))
+ 
+ 
+ if __name__ == "__main__":
+diff --git a/tests/test_llm_planner.py b/tests/test_llm_planner.py
+index de8343c..9baabb1 100644
+--- a/tests/test_llm_planner.py
++++ b/tests/test_llm_planner.py
+@@ -4,7 +4,9 @@ import json
+ import unittest
+ 
+ from sparkos.agent.llm_planner import LLMPlanner
+-from sparkos.agent.planner import PlanningContext
++from sparkos.agent.planner import Plan, PlanningContext, PlanStep, SkillCapability
++from sparkos.agent.scheduler import create_step_runs
++from sparkos.agent.step import StepResult, StepVerification
+ from sparkos.agent.task import AgentTask
+ from sparkos.infrastructure.llm.models import ChatMessage
+ 
+@@ -24,7 +26,12 @@ def planning_context() -> PlanningContext:
+         session_id="session-1",
+         summary="Earlier the user selected sales.csv.",
+         recent_messages=(ChatMessage(role="user", content="analyze it"),),
+-        skill_names=("spark-sql",),
++        skills=(
++            SkillCapability(
++                name="spark-sql",
++                description="Generate and optimize Spark SQL",
++            ),
++        ),
+         tool_names=("read_file", "shell"),
+     )
+ 
+@@ -40,11 +47,13 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
+                             "id": "s1",
+                             "description": "Inspect the input data",
+                             "depends_on": [],
++                            "success_criteria": "Input schema is known",
+                         },
+                         {
+                             "id": "s2",
+                             "description": "Write the findings",
+                             "depends_on": ["s1"],
++                            "success_criteria": "Findings are summarized",
+                         },
+                     ],
+                 }
+@@ -58,7 +67,8 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
+         assert plan is not None
+         self.assertEqual(plan.task_id, task.id)
+         self.assertEqual([step.id for step in plan.steps], ["s1", "s2"])
+-        self.assertEqual(plan.steps[1].depends_on, ["s1"])
++        self.assertEqual(plan.steps[1].depends_on, ("s1",))
++        self.assertEqual(plan.steps[1].success_criteria, "Findings are summarized")
+ 
+     async def test_simple_task_returns_none(self) -> None:
+         model = FakePlanningModel('{"should_plan": false, "steps": []}')
+@@ -201,10 +211,107 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
+         self.assertEqual(payload["goal"], "Analyze sales")
+         self.assertEqual(payload["input"], {"format": "csv"})
+         self.assertIn("sales.csv", payload["summary"])
+-        self.assertEqual(payload["skills"], ["spark-sql"])
++        self.assertEqual(
++            payload["skills"],
++            [
++                {
++                    "name": "spark-sql",
++                    "description": "Generate and optimize Spark SQL",
++                }
++            ],
++        )
+         self.assertEqual(payload["tools"], ["read_file", "shell"])
+         self.assertEqual(payload["recent_messages"][0]["content"], "analyze it")
+ 
++    async def test_revise_plan_increments_version_and_includes_failure_state(
++        self,
++    ) -> None:
++        model = FakePlanningModel(
++            json.dumps(
++                {
++                    "should_plan": True,
++                    "steps": [
++                        {
++                            "id": "s1",
++                            "description": "Inspect input",
++                            "depends_on": [],
++                            "success_criteria": "Input inspected",
++                        },
++                        {
++                            "id": "s3",
++                            "description": "Use fallback source",
++                            "depends_on": ["s1"],
++                            "success_criteria": "Fallback report complete",
++                        },
++                    ],
++                }
++            )
++        )
++        task = AgentTask(goal="Analyze")
++        failed_step = PlanStep(
++            id="s2",
++            description="Use primary source",
++            depends_on=("s1",),
++            success_criteria="Report complete",
++        )
++        current_plan = Plan(
++            id="plan-1",
++            task_id=task.id,
++            version=1,
++            steps=(
++                PlanStep(
++                    id="s1",
++                    description="Inspect input",
++                    success_criteria="Input inspected",
++                ),
++                failed_step,
++            ),
++        )
++        runs = create_step_runs(current_plan)
++        runs["s1"].start()
++        runs["s1"].succeed(StepResult(True, "schema loaded"))
++        runs["s2"].start()
++        runs["s2"].begin_verification(StepResult(True, "source blocked"))
++        runs["s2"].record_verification(
++            StepVerification(False, "primary source incomplete", True)
++        )
++        runs["s2"].prepare_retry()
++        runs["s2"].start()
++        runs["s2"].begin_verification(StepResult(True, "source still blocked"))
++        runs["s2"].record_verification(
++            StepVerification(False, "primary source blocked", False)
++        )
++
++        revised = await LLMPlanner(model).revise_plan(
++            task=task,
++            context=planning_context(),
++            current_plan=current_plan,
++            step_runs=runs,
++            failed_step=failed_step,
++            reason="primary source blocked",
++        )
++
++        self.assertIsNotNone(revised)
++        assert revised is not None
++        self.assertEqual(revised.version, 2)
++        self.assertEqual(revised.source, "replan")
++        self.assertEqual([step.id for step in revised.steps], ["s1", "s3"])
++        payload = json.loads(model.requests[0][1]["content"])
++        self.assertEqual(payload["failed_step"]["id"], "s2")
++        self.assertEqual(payload["failure_reason"], "primary source blocked")
++        self.assertEqual(
++            payload["step_runs"]["s1"]["result"]["output"],
++            "schema loaded",
++        )
++        self.assertEqual(
++            payload["step_runs"]["s2"]["result_history"][0]["output"],
++            "source blocked",
++        )
++        self.assertEqual(
++            payload["step_runs"]["s2"]["verification_history"][0]["reason"],
++            "primary source incomplete",
++        )
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_scheduler.py b/tests/test_scheduler.py
+new file mode 100644
+index 0000000..0d46893
+--- /dev/null
++++ b/tests/test_scheduler.py
+@@ -0,0 +1,94 @@
++from __future__ import annotations
++
++import unittest
++
++from sparkos.agent.planner import Plan, PlanStep
++from sparkos.agent.scheduler import PlanScheduler, create_direct_plan, create_step_runs
++from sparkos.agent.step import StepResult, StepStatus
++from sparkos.agent.task import AgentTask
++
++
++def sample_plan() -> Plan:
++    return Plan(
++        id="plan-1",
++        task_id="task-1",
++        steps=(
++            PlanStep(
++                id="s1",
++                description="read",
++                depends_on=(),
++                success_criteria="data loaded",
++            ),
++            PlanStep(
++                id="s2",
++                description="analyze",
++                depends_on=("s1",),
++                success_criteria="analysis produced",
++            ),
++            PlanStep(
++                id="s3",
++                description="report",
++                depends_on=("s2",),
++                success_criteria="report produced",
++            ),
++        ),
++    )
++
++
++class PlanSchedulerTests(unittest.TestCase):
++    def test_only_dependency_ready_steps_are_returned(self) -> None:
++        plan = sample_plan()
++        runs = create_step_runs(plan)
++        scheduler = PlanScheduler()
++
++        self.assertEqual(
++            [step.id for step in scheduler.ready_steps(plan, runs)],
++            ["s1"],
++        )
++
++        runs["s1"].start()
++        runs["s1"].succeed(StepResult(success=True, output="loaded"))
++
++        self.assertEqual(
++            [step.id for step in scheduler.ready_steps(plan, runs)],
++            ["s2"],
++        )
++
++    def test_failed_dependency_blocks_all_descendants(self) -> None:
++        plan = sample_plan()
++        runs = create_step_runs(plan)
++        scheduler = PlanScheduler()
++        runs["s1"].start()
++        runs["s1"].fail("read failed")
++
++        scheduler.block_failed_dependents(plan, runs)
++
++        self.assertEqual(runs["s2"].status, StepStatus.BLOCKED)
++        self.assertEqual(runs["s3"].status, StepStatus.BLOCKED)
++        self.assertTrue(scheduler.has_failed(runs))
++
++    def test_plan_completes_only_when_every_step_succeeds(self) -> None:
++        plan = sample_plan()
++        runs = create_step_runs(plan)
++        scheduler = PlanScheduler()
++        for run in runs.values():
++            run.start()
++            run.succeed(StepResult(success=True, output=run.step_id))
++
++        self.assertTrue(scheduler.is_complete(runs))
++        self.assertFalse(scheduler.has_failed(runs))
++
++    def test_direct_plan_wraps_simple_task_in_one_step(self) -> None:
++        task = AgentTask(id="task-1", goal="Say hello")
++
++        plan = create_direct_plan(task)
++
++        self.assertEqual(plan.source, "direct")
++        self.assertEqual(len(plan.steps), 1)
++        self.assertEqual(plan.steps[0].id, "direct")
++        self.assertEqual(plan.steps[0].description, "Say hello")
++        self.assertTrue(plan.steps[0].success_criteria)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_step_executor.py b/tests/test_step_executor.py
+new file mode 100644
+index 0000000..f13e1b0
+--- /dev/null
++++ b/tests/test_step_executor.py
+@@ -0,0 +1,200 @@
++from __future__ import annotations
++
++import json
++import unittest
++from collections.abc import AsyncIterator
++
++from sparkos.agent.planner import PlanStep
++from sparkos.agent.step import ArtifactRef, StepResult
++from sparkos.agent.step_executor import StepExecutionError, StepExecutor
++from sparkos.agent.task import AgentTask
++from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
++
++
++class FakeStepClient:
++    def __init__(self, turns: list[list[str | ToolCall]]) -> None:
++        self.turns = list(turns)
++        self.requests: list[list[dict]] = []
++
++    async def chat_stream(
++        self,
++        messages: list[ChatMessage],
++        tools: list[dict] | None = None,
++    ) -> AsyncIterator[str | ToolCall]:
++        del tools
++        self.requests.append([message.to_api_dict() for message in messages])
++        for item in self.turns.pop(0):
++            yield item
++
++
++def sample_step() -> PlanStep:
++    return PlanStep(
++        id="s2",
++        description="analyze data",
++        depends_on=("s1",),
++        success_criteria="analysis contains totals",
++    )
++
++
++def base_messages() -> list[ChatMessage]:
++    return [
++        ChatMessage(role="system", content="base prompt"),
++        ChatMessage(role="user", content="analyze sales"),
++    ]
++
++
++class StepExecutorTests(unittest.IsolatedAsyncioTestCase):
++    async def test_executor_injects_current_step_and_dependency_results(self) -> None:
++        client = FakeStepClient(turns=[["analysis done"]])
++        executor = StepExecutor(client=client, tools=[], tool_executor=None)
++        dependency = StepResult(
++            success=True,
++            output="120 rows loaded",
++            evidence=("schema validated",),
++            artifacts=(ArtifactRef(uri="artifact://sales", kind="table"),),
++        )
++
++        execution = await executor.execute(
++            task=AgentTask(
++                id="task-1",
++                goal="analyze sales",
++                input={"dataset": "sales.csv"},
++            ),
++            step=sample_step(),
++            dependency_results={"s1": dependency},
++            base_messages=base_messages(),
++        )
++
++        self.assertTrue(execution.result.success)
++        self.assertEqual(execution.result.output, "analysis done")
++        system_messages = [
++            message for message in client.requests[0] if message["role"] == "system"
++        ]
++        payload = json.loads(system_messages[-1]["content"].split("\n", 1)[1])
++        self.assertEqual(payload["task_input"], {"dataset": "sales.csv"})
++        self.assertEqual(payload["current_step"]["id"], "s2")
++        self.assertEqual(
++            payload["current_step"]["success_criteria"],
++            "analysis contains totals",
++        )
++        self.assertEqual(
++            payload["dependencies"]["s1"]["output"],
++            "120 rows loaded",
++        )
++        self.assertEqual(
++            payload["dependencies"]["s1"]["artifacts"][0]["uri"],
++            "artifact://sales",
++        )
++
++    async def test_executor_keeps_tool_transcript_local_to_step(self) -> None:
++        call = ToolCall(call_id="c1", name="read_file", arguments="{}")
++        client = FakeStepClient(turns=[[call], ["done"]])
++        original_messages = base_messages()
++        executor = StepExecutor(
++            client=client,
++            tools=[],
++            tool_executor=lambda *_: "file contents",
++        )
++
++        execution = await executor.execute(
++            task=AgentTask(id="task-1", goal="analyze sales"),
++            step=sample_step(),
++            dependency_results={},
++            base_messages=original_messages,
++        )
++
++        self.assertEqual(execution.result.output, "done")
++        self.assertEqual(execution.tool_calls[0].result, "file contents")
++        self.assertEqual(client.requests[1][-2]["tool_calls"][0]["id"], "c1")
++        self.assertEqual(client.requests[1][-1]["tool_call_id"], "c1")
++        self.assertEqual(len(original_messages), 2)
++
++    async def test_result_uses_only_final_non_tool_assistant_turn(self) -> None:
++        call = ToolCall(call_id="c1", name="read_file", arguments="{}")
++        client = FakeStepClient(turns=[["reading", call], ["final result"]])
++        executor = StepExecutor(
++            client=client,
++            tools=[],
++            tool_executor=lambda *_: "file contents",
++        )
++
++        execution = await executor.execute(
++            task=AgentTask(goal="analyze"),
++            step=sample_step(),
++            dependency_results={},
++            base_messages=base_messages(),
++        )
++
++        self.assertEqual(execution.result.output, "final result")
++        self.assertEqual(
++            [message["role"] for message in execution.transcript[-3:]],
++            ["assistant", "tool", "assistant"],
++        )
++
++    async def test_retries_empty_final_turn_after_successful_tool(self) -> None:
++        call = ToolCall(call_id="c1", name="web_fetch", arguments="{}")
++        client = FakeStepClient(
++            turns=[
++                [call],
++                [],
++                ["上海今天晴，33°C。"],
++            ]
++        )
++        executor = StepExecutor(
++            client=client,
++            tools=[],
++            tool_executor=lambda *_: "Shanghai: sunny, 33C",
++        )
++
++        execution = await executor.execute(
++            task=AgentTask(goal="上海"),
++            step=sample_step(),
++            dependency_results={},
++            base_messages=base_messages(),
++        )
++
++        self.assertTrue(execution.result.success)
++        self.assertEqual(execution.result.output, "上海今天晴，33°C。")
++        self.assertEqual(len(client.requests), 3)
++        self.assertTrue(
++            any("已有工具结果" in message["content"] for message in client.requests[2])
++        )
++
++    async def test_executor_rejects_empty_step_output(self) -> None:
++        executor = StepExecutor(
++            client=FakeStepClient(turns=[[]]),
++            tools=[],
++            tool_executor=None,
++        )
++
++        execution = await executor.execute(
++            task=AgentTask(goal="work"),
++            step=sample_step(),
++            dependency_results={},
++            base_messages=base_messages(),
++        )
++
++        self.assertFalse(execution.result.success)
++        self.assertEqual(execution.result.error, "步骤未产出结果")
++
++    async def test_executor_limits_tool_rounds(self) -> None:
++        first = ToolCall(call_id="c1", name="shell", arguments="{}")
++        second = ToolCall(call_id="c2", name="shell", arguments="{}")
++        executor = StepExecutor(
++            client=FakeStepClient(turns=[[first], [second]]),
++            tools=[],
++            tool_executor=lambda *_: "ok",
++            max_tool_rounds=1,
++        )
++
++        with self.assertRaisesRegex(StepExecutionError, "工具调用轮数超过限制"):
++            await executor.execute(
++                task=AgentTask(goal="loop"),
++                step=sample_step(),
++                dependency_results={},
++                base_messages=base_messages(),
++            )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_step_verifier.py b/tests/test_step_verifier.py
+new file mode 100644
+index 0000000..b5a1448
+--- /dev/null
++++ b/tests/test_step_verifier.py
+@@ -0,0 +1,130 @@
++from __future__ import annotations
++
++import json
++import unittest
++
++from sparkos.agent.planner import PlanStep
++from sparkos.agent.step import StepResult
++from sparkos.agent.task import AgentTask
++from sparkos.agent.verifier import LLMStepVerifier
++
++
++class FakeVerificationModel:
++    def __init__(self, response: str | Exception) -> None:
++        self.response = response
++        self.requests: list[list[dict]] = []
++
++    async def chat_once(self, messages: list[dict]) -> str:
++        self.requests.append(messages)
++        if isinstance(self.response, Exception):
++            raise self.response
++        return self.response
++
++
++def sample_step() -> PlanStep:
++    return PlanStep(
++        id="s2",
++        description="summarize weather",
++        depends_on=("s1",),
++        success_criteria="contains temperature and humidity",
++    )
++
++
++class LLMStepVerifierTests(unittest.IsolatedAsyncioTestCase):
++    async def test_rejection_is_parsed_and_request_contains_candidate_context(
++        self,
++    ) -> None:
++        model = FakeVerificationModel(
++            json.dumps(
++                {
++                    "passed": False,
++                    "reason": "missing temperature",
++                    "retryable": True,
++                    "evidence": ["humidity present"],
++                }
++            )
++        )
++        verifier = LLMStepVerifier(model)
++
++        verification = await verifier.verify(
++            task=AgentTask(goal="weather"),
++            step=sample_step(),
++            result=StepResult(success=True, output="humidity is 55%"),
++            dependency_results={
++                "s1": StepResult(success=True, output="raw weather loaded")
++            },
++        )
++
++        self.assertFalse(verification.passed)
++        self.assertTrue(verification.retryable)
++        self.assertEqual(verification.reason, "missing temperature")
++        self.assertEqual(verification.evidence, ("humidity present",))
++        payload = json.loads(model.requests[0][1]["content"])
++        self.assertEqual(
++            payload["step"]["success_criteria"],
++            "contains temperature and humidity",
++        )
++        self.assertEqual(payload["candidate_result"]["output"], "humidity is 55%")
++        self.assertEqual(
++            payload["dependency_results"]["s1"]["output"],
++            "raw weather loaded",
++        )
++
++    async def test_malformed_response_fails_open_and_records_error(self) -> None:
++        verifier = LLMStepVerifier(FakeVerificationModel("not-json"))
++
++        verification = await verifier.verify(
++            task=AgentTask(goal="weather"),
++            step=sample_step(),
++            result=StepResult(success=True, output="complete report"),
++            dependency_results={},
++        )
++
++        self.assertTrue(verification.passed)
++        self.assertFalse(verification.retryable)
++        self.assertIn("JSON", verification.error or "")
++
++    async def test_wrapped_json_fails_open_instead_of_becoming_rejection(
++        self,
++    ) -> None:
++        payload = json.dumps(
++            {
++                "passed": False,
++                "reason": "missing temperature",
++                "retryable": True,
++                "evidence": [],
++            }
++        )
++        for response in (f"result: {payload}", f"```json\n{payload}\n```"):
++            with self.subTest(response=response):
++                verifier = LLMStepVerifier(FakeVerificationModel(response))
++
++                verification = await verifier.verify(
++                    task=AgentTask(goal="weather"),
++                    step=sample_step(),
++                    result=StepResult(success=True, output="complete report"),
++                    dependency_results={},
++                )
++
++                self.assertTrue(verification.passed)
++                self.assertFalse(verification.retryable)
++                self.assertIsNotNone(verification.error)
++
++    async def test_model_failure_fails_open_and_records_error(self) -> None:
++        verifier = LLMStepVerifier(
++            FakeVerificationModel(ConnectionError("verifier offline"))
++        )
++
++        verification = await verifier.verify(
++            task=AgentTask(goal="weather"),
++            step=sample_step(),
++            result=StepResult(success=True, output="complete report"),
++            dependency_results={},
++        )
++
++        self.assertTrue(verification.passed)
++        self.assertIn("verifier offline", verification.error or "")
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_task_store.py b/tests/test_task_store.py
+new file mode 100644
+index 0000000..4b927e4
+--- /dev/null
++++ b/tests/test_task_store.py
+@@ -0,0 +1,222 @@
++from __future__ import annotations
++
++import json
++import unittest
++from pathlib import Path
++from tempfile import TemporaryDirectory
++
++from sparkos.agent.planner import Plan, PlanStep
++from sparkos.agent.scheduler import create_step_runs
++from sparkos.agent.step import ArtifactRef, StepResult, StepVerification
++from sparkos.agent.task import AgentTask
++from sparkos.agent.task_store import TaskStore
++from sparkos.infrastructure.persistence.task_store import JsonTaskStore
++
++
++class JsonTaskStoreTests(unittest.TestCase):
++    def test_json_store_writes_task_plan_and_step_runs(self) -> None:
++        task = AgentTask(id="task-1", goal="analyze", input={"file": "sales.csv"})
++        plan = Plan(
++            id="plan-1",
++            task_id=task.id,
++            source="planner",
++            steps=(
++                PlanStep(
++                    id="s1",
++                    description="read data",
++                    depends_on=(),
++                    success_criteria="data loaded",
++                ),
++            ),
++        )
++        task.active_plan_id = plan.id
++        task.start()
++        runs = create_step_runs(plan)
++        runs["s1"].start()
++        runs["s1"].succeed(
++            StepResult(
++                success=True,
++                output="loaded",
++                evidence=("120 rows",),
++                artifacts=(ArtifactRef(uri="artifact://data", kind="table"),),
++            )
++        )
++        runs["s1"].record_transcript(
++            (
++                {"role": "assistant", "content": ""},
++                {"role": "tool", "content": "loaded", "tool_call_id": "c1"},
++            )
++        )
++
++        with TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            store: TaskStore = JsonTaskStore(root)
++
++            store.save(task, plan, runs)
++
++            payload = json.loads((root / f"{task.id}.json").read_text(encoding="utf-8"))
++            self.assertEqual(payload["task"]["status"], "running")
++            self.assertEqual(payload["task"]["active_plan_id"], "plan-1")
++            self.assertEqual(
++                payload["plan"]["steps"][0]["success_criteria"],
++                "data loaded",
++            )
++            self.assertEqual(
++                payload["step_runs"]["s1"]["result"]["output"],
++                "loaded",
++            )
++            self.assertEqual(
++                payload["step_runs"]["s1"]["result"]["artifacts"][0],
++                {"uri": "artifact://data", "kind": "table"},
++            )
++            self.assertEqual(
++                payload["step_runs"]["s1"]["transcript"][-1]["tool_call_id"],
++                "c1",
++            )
++            self.assertEqual(list(root.glob("*.tmp")), [])
++
++    def test_json_store_writes_verification_and_attempt_history(self) -> None:
++        task = AgentTask(id="task-verify", goal="analyze")
++        plan = Plan(
++            task_id=task.id,
++            steps=(PlanStep(id="s1", description="analyze"),),
++        )
++        runs = create_step_runs(plan)
++        run = runs["s1"]
++        first = StepResult(success=True, output="incomplete")
++        rejection = StepVerification(False, "missing totals", True)
++        run.start()
++        run.record_transcript([{"role": "assistant", "content": "incomplete"}])
++        run.begin_verification(first)
++        run.record_verification(rejection)
++        run.prepare_retry()
++
++        with TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            JsonTaskStore(root).save(task, plan, runs)
++            payload = json.loads((root / f"{task.id}.json").read_text(encoding="utf-8"))
++
++        stored = payload["step_runs"]["s1"]
++        self.assertEqual(stored["result_history"][0]["output"], "incomplete")
++        self.assertEqual(
++            stored["verification_history"][0]["reason"],
++            "missing totals",
++        )
++        self.assertEqual(
++            stored["transcript_history"][0][0]["content"],
++            "incomplete",
++        )
++
++    def test_json_store_atomically_replaces_existing_snapshot(self) -> None:
++        task = AgentTask(id="task-1", goal="analyze")
++        plan = Plan(
++            id="plan-1",
++            task_id=task.id,
++            source="direct",
++            steps=(
++                PlanStep(
++                    id="direct",
++                    description="analyze",
++                    success_criteria="done",
++                ),
++            ),
++        )
++        runs = create_step_runs(plan)
++
++        with TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            store = JsonTaskStore(root)
++            store.save(task, plan, runs)
++            task.succeed("done")
++
++            store.save(task, plan, runs)
++
++            payload = json.loads((root / f"{task.id}.json").read_text(encoding="utf-8"))
++            self.assertEqual(payload["task"]["status"], "succeeded")
++            self.assertEqual(payload["task"]["result"], "done")
++            self.assertEqual(list(root.iterdir()), [root / "task-1.json"])
++
++    def test_json_store_rejects_task_id_path_escape(self) -> None:
++        task = AgentTask(id="../outside", goal="unsafe")
++        plan = Plan(
++            task_id=task.id,
++            steps=(PlanStep(id="direct", description="unsafe"),),
++        )
++        runs = create_step_runs(plan)
++
++        with TemporaryDirectory() as temporary_directory:
++            parent = Path(temporary_directory)
++            store = JsonTaskStore(parent / "tasks")
++
++            with self.assertRaisesRegex(ValueError, "task id"):
++                store.save(task, plan, runs)
++
++            self.assertFalse((parent / "outside.json").exists())
++
++    def test_json_store_archives_previous_plan_when_replanned(self) -> None:
++        task = AgentTask(id="task-replan", goal="analyze")
++        first_plan = Plan(
++            id="plan-1",
++            task_id=task.id,
++            steps=(PlanStep(id="s1", description="primary"),),
++        )
++        first_runs = create_step_runs(first_plan)
++        first_runs["s1"].start()
++        first_runs["s1"].fail("source blocked")
++        second_plan = Plan(
++            id="plan-2",
++            task_id=task.id,
++            version=2,
++            source="replan",
++            steps=(PlanStep(id="s2", description="fallback"),),
++        )
++        second_runs = create_step_runs(second_plan)
++
++        with TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            store = JsonTaskStore(root)
++            store.save(task, first_plan, first_runs)
++            store.save(task, second_plan, second_runs)
++            payload = json.loads((root / f"{task.id}.json").read_text(encoding="utf-8"))
++
++        self.assertEqual(payload["plan"]["id"], "plan-2")
++        self.assertEqual(payload["plan_history"][0]["plan"]["id"], "plan-1")
++        self.assertEqual(
++            payload["plan_history"][0]["step_runs"]["s1"]["error"],
++            "source blocked",
++        )
++
++    def test_json_store_archives_changed_plan_even_if_id_is_reused(self) -> None:
++        task = AgentTask(id="task-reused-plan-id", goal="analyze")
++        first_plan = Plan(
++            id="plan-1",
++            task_id=task.id,
++            steps=(PlanStep(id="s1", description="primary"),),
++        )
++        first_runs = create_step_runs(first_plan)
++        first_runs["s1"].start()
++        first_runs["s1"].fail("source blocked")
++        second_plan = Plan(
++            id="plan-1",
++            task_id=task.id,
++            version=2,
++            source="replan",
++            steps=(PlanStep(id="s2", description="fallback"),),
++        )
++
++        with TemporaryDirectory() as temporary_directory:
++            root = Path(temporary_directory)
++            store = JsonTaskStore(root)
++            store.save(task, first_plan, first_runs)
++            store.save(task, second_plan, create_step_runs(second_plan))
++            payload = json.loads((root / f"{task.id}.json").read_text(encoding="utf-8"))
++
++        self.assertEqual(payload["plan_history"][0]["plan"]["version"], 1)
++        self.assertEqual(
++            payload["plan_history"][0]["step_runs"]["s1"]["error"],
++            "source blocked",
++        )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_ui_integration.py b/tests/test_ui_integration.py
+index dfb3e49..7e386e3 100644
+--- a/tests/test_ui_integration.py
++++ b/tests/test_ui_integration.py
+@@ -4,6 +4,7 @@ import unittest
+ 
+ from sparkos.agent.llm_planner import LLMPlanner
+ from sparkos.agent.runtime import AgentRuntime
++from sparkos.agent.verifier import LLMStepVerifier
+ from sparkos.ui.chat_app import ChatApp
+ 
+ 
+@@ -19,6 +20,12 @@ class ChatAppIntegrationTests(unittest.TestCase):
+         self.assertIsInstance(app.runtime.planner, LLMPlanner)
+         self.assertIs(app.runtime.planner.model, app.runtime.client)
+ 
++    def test_chat_app_enables_llm_step_verifier(self) -> None:
++        app = ChatApp()
++
++        self.assertIsInstance(app.runtime.verifier, LLMStepVerifier)
++        self.assertIs(app.runtime.verifier.model, app.runtime.client)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

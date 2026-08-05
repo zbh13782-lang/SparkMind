@@ -132,7 +132,9 @@ Expected: all verifier tests pass.
 
 ```python
 self.assertEqual(run.attempt_count, 2)
-self.assertEqual([type(e) for e in events if isinstance(e, StepRetrying)], [StepRetrying])
+self.assertEqual(
+    [type(e) for e in events if isinstance(e, StepRetrying)], [StepRetrying]
+)
 self.assertEqual(task.status, TaskStatus.SUCCEEDED)
 self.assertIn("missing temperature", second_attempt_system_message)
 ```
@@ -173,7 +175,9 @@ Expected: all Runtime/UI tests pass.
 - [ ] **Step 1: Write failing replan parsing and orchestration tests**
 
 ```python
-revised = await planner.revise_plan(task, context, old_plan, runs, failed_step, "blocked source")
+revised = await planner.revise_plan(
+    task, context, old_plan, runs, failed_step, "blocked source"
+)
 self.assertEqual(revised.version, old_plan.version + 1)
 self.assertEqual(revised.source, "replan")
 ```

@@ -41,6 +41,7 @@ def test_tool_message_serializes_tool_call_id(self):
         {"role": "tool", "content": "ok", "tool_call_id": "call-1"},
     )
 
+
 def test_task_lifecycle_records_result(self):
     task = AgentTask(goal="analyze")
     task.start()
@@ -64,6 +65,7 @@ class TaskStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
 
 @dataclass
 class AgentTask:
@@ -104,6 +106,7 @@ def test_build_messages_never_silently_drops_uncompacted_history(self):
     messages = context.build_messages(skills=[], tools=[])
     self.assertEqual([m.content for m in messages], [str(i) for i in range(WINDOW + 1)])
 
+
 def test_tool_result_is_recorded_as_tool_message(self):
     context = AgentContext()
     context.record_tool("call-1", "result")
@@ -143,9 +146,13 @@ Expected: all context tests pass.
 async def test_runtime_records_assistant_call_before_tool_result(self):
     client = FakeClient(turns=[[ToolCall("c1", "read_file", "{}")], ["done"]])
     context = AgentContext()
-    runtime = AgentRuntime(context=context, client=client, tools=[], tool_executor=lambda *_: "ok")
+    runtime = AgentRuntime(
+        context=context, client=client, tools=[], tool_executor=lambda *_: "ok"
+    )
     await collect(runtime.run(AgentTask(goal="work")))
-    self.assertEqual([m.role for m in context.history], ["user", "assistant", "tool", "assistant"])
+    self.assertEqual(
+        [m.role for m in context.history], ["user", "assistant", "tool", "assistant"]
+    )
     self.assertEqual(context.history[2].tool_call_id, "c1")
 ```
 

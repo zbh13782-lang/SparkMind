@@ -110,6 +110,20 @@ class AgentContext:
             ChatMessage(role="tool", content=result, tool_call_id=tool_call_id)
         )
 
+    def record_tool_round(
+        self,
+        messages: tuple[dict[str, Any], ...],
+    ) -> None:
+        """Atomically record one complete assistant/tool round to history.
+
+        The caller supplies the assistant(tool_calls) message followed by every
+        corresponding tool(tool_call_id) result. Building the full list before
+        extending history prevents a deserialization error from leaving a
+        partial round behind.
+        """
+        round_messages = [self.deserialize_message(message) for message in messages]
+        self.history.extend(round_messages)
+
     def needs_compact(self) -> bool:
         return len(self.history) - self.summary_upto > WINDOW
 

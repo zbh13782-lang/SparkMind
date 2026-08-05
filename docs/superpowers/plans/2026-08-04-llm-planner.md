@@ -32,9 +32,12 @@
 
 ```python
 async def test_complex_task_returns_dependency_aware_plan(self):
-    model = FakePlanningModel('{"should_plan":true,"steps":[{"id":"s1","description":"inspect","depends_on":[]},{"id":"s2","description":"report","depends_on":["s1"]}]}')
+    model = FakePlanningModel(
+        '{"should_plan":true,"steps":[{"id":"s1","description":"inspect","depends_on":[]},{"id":"s2","description":"report","depends_on":["s1"]}]}'
+    )
     plan = await LLMPlanner(model).create_plan(task, context)
     self.assertEqual(plan.steps[1].depends_on, ["s1"])
+
 
 async def test_simple_task_returns_none(self):
     model = FakePlanningModel('{"should_plan":false,"steps":[]}')
@@ -90,6 +93,7 @@ async def test_runtime_injects_created_plan_into_executor_context(self):
     await collect_events(runtime, task)
     contents = [message["content"] for message in client.requests[0]]
     self.assertTrue(any("inspect" in content for content in contents))
+
 
 def test_chat_app_enables_llm_planner(self):
     app = ChatApp()

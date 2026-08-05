@@ -40,6 +40,7 @@ class StepExecutionError(RuntimeError):
 class StepToolExecution:
     tool_call: ToolCall
     transcript: tuple[dict[str, Any], ...]
+    history_messages: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -181,25 +182,47 @@ class StepExecutor:
 
             if tool_rounds >= self.max_tool_rounds:
                 error = f"工具调用轮数超过限制（{self.max_tool_rounds}）"
-                for tool_call in tool_calls:
+                tool_result_messages: list[dict[str, Any]] = []
+                for index, tool_call in enumerate(tool_calls):
                     tool_call.result = error
                     tool_message = self._append_tool_result(messages, tool_call)
-                    transcript.append(tool_message.to_api_dict())
+                    serialized_tool_message = tool_message.to_api_dict()
+                    transcript.append(serialized_tool_message)
+                    tool_result_messages.append(serialized_tool_message)
                     yield StepToolExecution(
                         tool_call=tool_call,
                         transcript=tuple(deepcopy(transcript)),
+                        history_messages=(
+                            self._tool_round_history(
+                                assistant_message,
+                                tool_result_messages,
+                            )
+                            if index == len(tool_calls) - 1
+                            else ()
+                        ),
                     )
                 raise StepExecutionError(error, tuple(transcript))
 
             tool_rounds += 1
-            for tool_call in tool_calls:
+            tool_result_messages = []
+            for index, tool_call in enumerate(tool_calls):
                 tool_call.result = await self._execute_tool_call(tool_call)
                 executed_calls.append(tool_call)
                 tool_message = self._append_tool_result(messages, tool_call)
-                transcript.append(tool_message.to_api_dict())
+                serialized_tool_message = tool_message.to_api_dict()
+                transcript.append(serialized_tool_message)
+                tool_result_messages.append(serialized_tool_message)
                 yield StepToolExecution(
                     tool_call=tool_call,
                     transcript=tuple(deepcopy(transcript)),
+                    history_messages=(
+                        self._tool_round_history(
+                            assistant_message,
+                            tool_result_messages,
+                        )
+                        if index == len(tool_calls) - 1
+                        else ()
+                    ),
                 )
 
         output = turn_text.strip()
@@ -289,6 +312,17 @@ class StepExecutor:
         )
         messages.append(message)
         return message
+
+    @staticmethod
+    def _tool_round_history(
+        assistant_message: ChatMessage,
+        tool_result_messages: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            deepcopy(
+                [assistant_message.to_api_dict(), *tool_result_messages]
+            )
+        )
 
     async def _execute_tool_call(self, tool_call: ToolCall) -> str:
         if self.tool_executor is None:

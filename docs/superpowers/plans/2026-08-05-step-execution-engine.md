@@ -39,7 +39,9 @@
 
 ```python
 def test_step_run_owns_execution_state(self):
-    step = PlanStep(id="s1", description="read", depends_on=(), success_criteria="data loaded")
+    step = PlanStep(
+        id="s1", description="read", depends_on=(), success_criteria="data loaded"
+    )
     run = StepRun(step_id=step.id)
     run.start()
     run.succeed(StepResult(success=True, output="loaded"))
@@ -199,7 +201,9 @@ Expected: all executor tests pass.
 ```python
 async def test_runtime_executes_plan_steps_in_dependency_order(self):
     events = await collect_events(runtime, task)
-    self.assertEqual([e.step.id for e in events if isinstance(e, StepStarted)], ["s1", "s2"])
+    self.assertEqual(
+        [e.step.id for e in events if isinstance(e, StepStarted)], ["s1", "s2"]
+    )
     self.assertEqual([m.role for m in context.history], ["user", "assistant"])
     self.assertEqual(task.status, TaskStatus.SUCCEEDED)
 ```

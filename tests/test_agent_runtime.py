@@ -25,6 +25,7 @@ from sparkos.agent.planner import Plan, PlanStep
 from sparkos.agent.runtime import AgentRuntime
 from sparkos.agent.skills.loader import Skill
 from sparkos.agent.step import StepRun, StepStatus, StepVerification
+from sparkos.agent.step_executor import StepExecutionError
 from sparkos.agent.task import AgentTask, TaskStatus
 from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
 
@@ -766,7 +767,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "still incomplete"):
             await collect_events(runtime, AgentTask(goal="work"))
 
-    async def test_step_tool_calls_emit_scoped_events_not_session_messages(
+    async def test_step_tool_calls_emit_scoped_events_and_session_history(
         self,
     ) -> None:
         call = ToolCall(call_id="c1", name="read_file", arguments="{}")
@@ -792,14 +793,110 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tool_events[0].tool_call.result, "file contents")
         self.assertEqual(
             [message.role for message in context.history],
-            ["user", "assistant"],
+            ["user", "assistant", "tool", "assistant"],
         )
+        self.assertEqual(context.history[1].tool_calls, [call.to_api_dict()])
+        self.assertEqual(context.history[2].role, "tool")
+        self.assertEqual(context.history[2].tool_call_id, "c1")
+        self.assertEqual(context.history[2].content, "file contents")
+        self.assertEqual(context.history[3].content, "done")
         self.assertTrue(
             any(
                 snapshot["transcripts"]["direct"]
                 and snapshot["transcripts"]["direct"][-1].get("tool_call_id") == "c1"
                 for snapshot in store.snapshots
             )
+        )
+
+    async def test_multiple_tool_calls_are_recorded_as_one_history_round(
+        self,
+    ) -> None:
+        first = ToolCall(call_id="c1", name="shell", arguments="{}")
+        second = ToolCall(call_id="c2", name="shell", arguments="{}")
+        context = context_without_disk()
+        client = FakeClient(turns=[[first, second], ["done"], ["follow-up done"]])
+        runtime = AgentRuntime(
+            context=context,
+            client=client,
+            skills=[],
+            tools=[],
+            tool_executor=lambda *_: "ok",
+            task_store=FakeTaskStore(),
+        )
+
+        try:
+            events = await collect_events(runtime, AgentTask(goal="multi"))
+        except TypeError as exc:
+            self.fail(f"multiple tool calls must not corrupt history: {exc}")
+
+        tool_events = [
+            event for event in events if isinstance(event, StepToolCompleted)
+        ]
+        self.assertEqual(len(tool_events), 2)
+        self.assertEqual(
+            [message.role for message in context.history],
+            ["user", "assistant", "tool", "tool", "assistant"],
+        )
+        self.assertEqual(
+            context.history[1].tool_calls,
+            [first.to_api_dict(), second.to_api_dict()],
+        )
+        self.assertEqual(
+            [context.history[2].tool_call_id, context.history[3].tool_call_id],
+            ["c1", "c2"],
+        )
+
+        await collect_events(runtime, AgentTask(goal="what happened?"))
+
+        replayed_history = [
+            message
+            for message in client.requests[2]
+            if message["role"] != "system"
+        ]
+        self.assertEqual(
+            [message["role"] for message in replayed_history],
+            ["user", "assistant", "tool", "tool", "assistant", "user"],
+        )
+        self.assertEqual(replayed_history[1]["tool_calls"][0]["id"], "c1")
+        self.assertEqual(replayed_history[2]["tool_call_id"], "c1")
+        self.assertEqual(replayed_history[3]["tool_call_id"], "c2")
+
+    async def test_cancelled_multi_tool_round_does_not_record_partial_history(
+        self,
+    ) -> None:
+        first = ToolCall(call_id="c1", name="fast_tool", arguments="{}")
+        second = ToolCall(call_id="c2", name="slow_tool", arguments="{}")
+        second_started = asyncio.Event()
+
+        async def tool_executor(name: str, arguments: dict) -> str:
+            del arguments
+            if name == "fast_tool":
+                return "first result"
+            second_started.set()
+            await asyncio.Event().wait()
+            return "unreachable"
+
+        context = context_without_disk()
+        runtime = AgentRuntime(
+            context=context,
+            client=FakeClient(turns=[[first, second]]),
+            skills=[],
+            tools=[],
+            tool_executor=tool_executor,
+            task_store=FakeTaskStore(),
+        )
+
+        execution = asyncio.create_task(
+            collect_events(runtime, AgentTask(goal="cancel multi"))
+        )
+        await second_started.wait()
+        execution.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await execution
+
+        self.assertEqual(
+            [message.role for message in context.history],
+            ["user"],
         )
 
     async def test_runtime_compacts_before_step_execution(self) -> None:
@@ -867,7 +964,34 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(task.status, TaskStatus.FAILED)
         self.assertEqual(
-            [message.role for message in runtime.context.history], ["user"]
+            [message.role for message in runtime.context.history],
+            ["user", "assistant", "tool", "assistant", "tool"],
+        )
+
+    async def test_tool_round_limit_records_multiple_results_once(self) -> None:
+        first = ToolCall(call_id="c1", name="shell", arguments="{}")
+        second = ToolCall(call_id="c2", name="shell", arguments="{}")
+        context = context_without_disk()
+        runtime = AgentRuntime(
+            context=context,
+            client=FakeClient(turns=[[first, second]]),
+            skills=[],
+            tools=[],
+            tool_executor=lambda *_: "unreachable",
+            max_tool_rounds=0,
+            task_store=FakeTaskStore(),
+        )
+
+        with self.assertRaisesRegex(StepExecutionError, "工具调用轮数超过限制"):
+            await collect_events(runtime, AgentTask(goal="limit multi"))
+
+        self.assertEqual(
+            [message.role for message in context.history],
+            ["user", "assistant", "tool", "tool"],
+        )
+        self.assertEqual(
+            [context.history[2].tool_call_id, context.history[3].tool_call_id],
+            ["c1", "c2"],
         )
 
     async def test_cancelling_task_cancels_running_step_snapshot(self) -> None:

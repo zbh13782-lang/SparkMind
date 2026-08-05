@@ -209,6 +209,8 @@ class AgentRuntime:
                             self._save_task(task, plan, step_runs)
                         elif isinstance(update, StepToolExecution):
                             run.record_transcript(update.transcript)
+                            if update.history_messages:
+                                self.context.record_tool_round(update.history_messages)
                             self._save_task(task, plan, step_runs)
                             yield StepToolCompleted(
                                 step=step,
