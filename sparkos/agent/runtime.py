@@ -11,6 +11,7 @@ from typing import Any, Protocol, cast
 from sparkos.agent.context import WINDOW, AgentContext
 from sparkos.agent.events import (
     AgentEvent,
+    ClarificationRequested,
     PlanCreated,
     PlanReplanned,
     StepCompleted,
@@ -26,6 +27,7 @@ from sparkos.agent.events import (
 )
 from sparkos.agent.llm_planner import LLMPlanner
 from sparkos.agent.planner import (
+    ClarificationRequest,
     Plan,
     Planner,
     PlanningContext,
@@ -152,8 +154,22 @@ class AgentRuntime:
 
             await self._compact_if_needed()
 
+            planning_decision: Plan | ClarificationRequest | None = None
             if self.planner is not None:
-                plan = await self.planner.create_plan(task, self._planning_context())
+                planning_decision = await self.planner.create_plan(
+                    task,
+                    self._planning_context(),
+                )
+            if isinstance(planning_decision, ClarificationRequest):
+                question = planning_decision.question
+                task.wait_for_input(question)
+                self.context.record_assistant(question)
+                self.context.persist()
+                self._save_task(task, None, {})
+                yield ClarificationRequested(task=task, question=question)
+                return
+
+            plan = planning_decision
             if plan is None:
                 plan = create_direct_plan(task)
 
@@ -341,10 +357,24 @@ class AgentRuntime:
             if plan.source == "direct":
                 final_answer = step_runs[plan.steps[0].id].result
                 answer = final_answer.output if final_answer is not None else ""
+                if self._is_textual_tool_call(answer):
+                    answer = self._fallback_answer(plan, step_runs)
                 if answer:
-                    yield TextDelta(answer)
+                    chunks = (
+                        execution.text_chunks
+                        if execution is not None
+                        and "".join(execution.text_chunks).strip() == answer
+                        else ()
+                    )
+                    if chunks:
+                        for delta in chunks:
+                            yield TextDelta(delta)
+                    else:
+                        yield TextDelta(answer)
             else:
                 answer_parts: list[str] = []
+                pending_deltas: list[str] = []
+                streaming_started = False
                 async for delta in self._synthesize_final(
                     task=task,
                     plan=plan,
@@ -352,11 +382,29 @@ class AgentRuntime:
                     base_messages=base_messages,
                 ):
                     answer_parts.append(delta)
+                    if streaming_started:
+                        yield TextDelta(delta)
+                        continue
+
+                    pending_deltas.append(delta)
+                    prefix = "".join(answer_parts).lstrip().casefold()
+                    if "<tool_call".startswith(prefix) or prefix.startswith(
+                        "<tool_call"
+                    ):
+                        continue
+
+                    streaming_started = True
+                    for pending_delta in pending_deltas:
+                        yield TextDelta(pending_delta)
+                    pending_deltas.clear()
                 answer = "".join(answer_parts).strip()
                 if not answer or self._is_textual_tool_call(answer):
                     answer = self._fallback_answer(plan, step_runs)
-                if answer:
-                    yield TextDelta(answer)
+                    if answer:
+                        yield TextDelta(answer)
+                elif not streaming_started:
+                    for pending_delta in pending_deltas:
+                        yield TextDelta(pending_delta)
 
             task.succeed(answer)
             self.context.record_assistant(answer)
@@ -372,8 +420,7 @@ class AgentRuntime:
             }:
                 active_run.cancel()
             self.context.persist()
-            if plan is not None:
-                self._save_task_best_effort(task, plan, step_runs)
+            self._save_task_best_effort(task, plan, step_runs)
             return
         except asyncio.CancelledError:
             task.cancel()
@@ -383,14 +430,12 @@ class AgentRuntime:
             }:
                 active_run.cancel()
             self.context.persist()
-            if plan is not None:
-                self._save_task_best_effort(task, plan, step_runs)
+            self._save_task_best_effort(task, plan, step_runs)
             raise
         except Exception as exc:
             task.fail(str(exc))
             self.context.persist()
-            if plan is not None:
-                self._save_task_best_effort(task, plan, step_runs)
+            self._save_task_best_effort(task, plan, step_runs)
             yield TaskFailed(task)
             raise
 
@@ -440,18 +485,22 @@ class AgentRuntime:
             "error": result.error,
         }
 
-    @staticmethod
-    def _fallback_answer(plan: Plan, step_runs: dict[str, StepRun]) -> str:
+    @classmethod
+    def _fallback_answer(cls, plan: Plan, step_runs: dict[str, StepRun]) -> str:
         for step in reversed(plan.steps):
             result = step_runs[step.id].result
-            if result is not None and result.output:
+            if (
+                result is not None
+                and result.output
+                and not cls._is_textual_tool_call(result.output)
+            ):
                 return result.output
-        return ""
+        return "未能生成有效的最终回答，请重试。"
 
     @staticmethod
     def _is_textual_tool_call(text: str) -> bool:
         normalized = text.lstrip().casefold()
-        return normalized.startswith("<tool_call") and "</tool_call>" in normalized
+        return normalized.startswith("<tool_call")
 
     @staticmethod
     def _insert_system_message(
@@ -474,7 +523,7 @@ class AgentRuntime:
     def _save_task(
         self,
         task: AgentTask,
-        plan: Plan,
+        plan: Plan | None,
         step_runs: dict[str, StepRun],
     ) -> None:
         self.task_store.save(task, plan, step_runs)
@@ -537,7 +586,7 @@ class AgentRuntime:
     def _save_task_best_effort(
         self,
         task: AgentTask,
-        plan: Plan,
+        plan: Plan | None,
         step_runs: dict[str, StepRun],
     ) -> None:
         try:

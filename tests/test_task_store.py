@@ -14,6 +14,23 @@ from sparkos.infrastructure.persistence.task_store import JsonTaskStore
 
 
 class JsonTaskStoreTests(unittest.TestCase):
+    def test_json_store_writes_waiting_input_task_without_plan(self) -> None:
+        task = AgentTask(id="task-clarify", goal="帮我分析一下")
+        task.wait_for_input("请提供要分析的文件路径。")
+
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            JsonTaskStore(root).save(task, None, {})
+            payload = json.loads((root / f"{task.id}.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["task"]["status"], "waiting_input")
+        self.assertEqual(
+            payload["task"]["clarification_question"],
+            "请提供要分析的文件路径。",
+        )
+        self.assertIsNone(payload["plan"])
+        self.assertEqual(payload["step_runs"], {})
+
     def test_json_store_writes_task_plan_and_step_runs(self) -> None:
         task = AgentTask(id="task-1", goal="analyze", input={"file": "sales.csv"})
         plan = Plan(

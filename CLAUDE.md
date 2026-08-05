@@ -72,6 +72,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - `slash-hint` 通过 `self._slash_hint` 实例引用操作，不用 `query_one` 查 ID（避免 `_load_session` 后 widget 失效）
 - 事件系统使用 union type `AgentEvent`，frozen dataclass 保证不可变性
 
+**utils 层** — `utils/`
+
+- `_tiktoken.py`：基于 `tiktoken` 的 token 计数工具；`count_text(text, model)` 统计纯文本 token 数，`count_messages(messages, model)` 统计 `ChatMessage` 列表的 token 数（含消息 overhead 和 tool_calls）。找不到模型编码时自动回退到 `cl100k_base`
+
 ## Runtime Environment
 
 - `SPARKOS_REPO_ROOT`：文件浏览器的浏览根目录，默认当前工作目录

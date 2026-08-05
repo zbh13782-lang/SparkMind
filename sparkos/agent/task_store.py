@@ -13,7 +13,7 @@ class TaskStore(Protocol):
     def save(
         self,
         task: AgentTask,
-        plan: Plan,
+        plan: Plan | None,
         step_runs: dict[str, StepRun],
     ) -> None: ...
 

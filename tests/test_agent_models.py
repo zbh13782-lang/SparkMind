@@ -61,6 +61,14 @@ class AgentTaskTests(unittest.TestCase):
 
         self.assertEqual(task.status, TaskStatus.PLANNING)
 
+    def test_task_can_wait_for_clarification(self) -> None:
+        task = AgentTask(goal="analyze")
+
+        task.wait_for_input("  Which file should I analyze?  ")
+
+        self.assertEqual(task.status, TaskStatus.WAITING_INPUT)
+        self.assertEqual(task.clarification_question, "Which file should I analyze?")
+
     def test_task_lifecycle_records_result(self) -> None:
         task = AgentTask(goal="analyze")
 

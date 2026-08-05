@@ -32,7 +32,7 @@ class FileBrowserScreen(Screen):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Static("", id="file-browser-path")
+        yield Static("", id="file-browser-path", markup=False)
         with VerticalScroll(id="file-list"):
             pass
         yield Footer()

@@ -5,7 +5,13 @@ from __future__ import annotations
 import json
 from typing import Any, Protocol
 
-from sparkos.agent.planner import Plan, Planner, PlanningContext, PlanStep
+from sparkos.agent.planner import (
+    ClarificationRequest,
+    Plan,
+    Planner,
+    PlanningContext,
+    PlanStep,
+)
 from sparkos.agent.step import StepResult, StepRun, StepVerification
 from sparkos.agent.task import AgentTask
 
@@ -14,6 +20,7 @@ _PLANNER_PROMPT_TEMPLATE = """你是 Agent 的任务规划器。你的职责仅�
 只输出一个 JSON 对象，不要输出 Markdown 或解释：
 {
   "should_plan": true,
+  "clarification_question": null,
   "steps": [
     {
       "id": "s1",
@@ -25,7 +32,9 @@ _PLANNER_PROMPT_TEMPLATE = """你是 Agent 的任务规划器。你的职责仅�
 }
 
 规则：
-- 简单问答、单次工具调用或一步即可完成的任务，返回 {"should_plan": false, "steps": []}。
+- 如果缺少完成任务所必需、且无法从上下文推断的用户信息，返回 {"should_plan": false, "clarification_question": "一个简洁、具体的问题", "steps": []}。
+- 不要追问可选偏好或能合理默认的信息；简单问答、单次工具调用或一步即可完成的任务，返回 {"should_plan": false, "clarification_question": null, "steps": []}。
+- 需要规划时 clarification_question 必须为 null。
 - 只有确实需要多个相互依赖动作时才规划。
 - 最多 {max_steps} 步；每步只描述一个动作。
 - 每步必须给出明确、可验证的 success_criteria。
@@ -73,12 +82,12 @@ class LLMPlanner(Planner):
         self,
         task: AgentTask,
         context: PlanningContext,
-    ) -> Plan | None:
+    ) -> Plan | ClarificationRequest | None:
         try:
             request = self._build_request(task, context)
             response = await self.model.chat_once(request)
             payload = self._parse_payload(response)
-            return self._build_plan(task, payload)
+            return self._build_initial_decision(task, payload)
         except Exception:  # noqa: BLE001
             # Planning is an optional optimization. Invalid output or a planning
             # model failure must not prevent Runtime from executing the task.
@@ -282,6 +291,27 @@ class LLMPlanner(Planner):
             version=version,
             source=source,
         )
+
+    def _build_initial_decision(
+        self,
+        task: AgentTask,
+        payload: dict[str, Any],
+    ) -> Plan | ClarificationRequest | None:
+        should_plan = payload.get("should_plan")
+        if not isinstance(should_plan, bool):
+            raise TypeError("should_plan 必须是布尔值")
+
+        clarification = payload.get("clarification_question")
+        if not should_plan:
+            if clarification is None:
+                return None
+            if not isinstance(clarification, str) or not clarification.strip():
+                raise ValueError("clarification_question 必须是非空字符串或 null")
+            return ClarificationRequest(question=clarification.strip())
+
+        if clarification is not None:
+            raise ValueError("需要规划时 clarification_question 必须为 null")
+        return self._build_plan(task, payload)
 
     @staticmethod
     def _serialize_step(step: PlanStep) -> dict[str, Any]:

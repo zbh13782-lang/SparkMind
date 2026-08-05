@@ -4,7 +4,13 @@ import json
 import unittest
 
 from sparkos.agent.llm_planner import LLMPlanner
-from sparkos.agent.planner import Plan, PlanningContext, PlanStep, SkillCapability
+from sparkos.agent.planner import (
+    ClarificationRequest,
+    Plan,
+    PlanningContext,
+    PlanStep,
+    SkillCapability,
+)
 from sparkos.agent.scheduler import create_step_runs
 from sparkos.agent.step import StepResult, StepVerification
 from sparkos.agent.task import AgentTask
@@ -78,6 +84,37 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIsNone(plan)
+
+    async def test_unclear_task_returns_clarification_request(self) -> None:
+        model = FakePlanningModel(
+            json.dumps(
+                {
+                    "should_plan": False,
+                    "clarification_question": "  请提供要分析的文件路径。  ",
+                    "steps": [],
+                }
+            )
+        )
+
+        decision = await LLMPlanner(model).create_plan(
+            AgentTask(goal="帮我分析一下"), planning_context()
+        )
+
+        self.assertEqual(
+            decision,
+            ClarificationRequest(question="请提供要分析的文件路径。"),
+        )
+
+    async def test_blank_clarification_falls_back_to_direct_execution(self) -> None:
+        model = FakePlanningModel(
+            '{"should_plan":false,"clarification_question":"  ","steps":[]}'
+        )
+
+        decision = await LLMPlanner(model).create_plan(
+            AgentTask(goal="帮我处理"), planning_context()
+        )
+
+        self.assertIsNone(decision)
 
     async def test_markdown_fenced_json_is_accepted(self) -> None:
         model = FakePlanningModel(

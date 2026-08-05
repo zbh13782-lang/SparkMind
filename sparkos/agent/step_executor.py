@@ -53,6 +53,7 @@ class StepExecution:
     result: StepResult
     tool_calls: tuple[ToolCall, ...] = ()
     transcript: tuple[dict[str, Any], ...] = ()
+    text_chunks: tuple[str, ...] = ()
 
 
 class StepExecutor:
@@ -241,6 +242,7 @@ class StepExecutor:
             result=StepResult(success=True, output=output),
             tool_calls=tuple(executed_calls),
             transcript=tuple(deepcopy(transcript)),
+            text_chunks=tuple(turn_parts),
         )
 
     @staticmethod
@@ -318,11 +320,7 @@ class StepExecutor:
         assistant_message: ChatMessage,
         tool_result_messages: list[dict[str, Any]],
     ) -> tuple[dict[str, Any], ...]:
-        return tuple(
-            deepcopy(
-                [assistant_message.to_api_dict(), *tool_result_messages]
-            )
-        )
+        return tuple(deepcopy([assistant_message.to_api_dict(), *tool_result_messages]))
 
     async def _execute_tool_call(self, tool_call: ToolCall) -> str:
         if self.tool_executor is None:

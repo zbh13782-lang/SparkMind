@@ -10,6 +10,7 @@ from textual.screen import Screen
 from textual.widgets import Button, Footer, Header, Markdown, Static
 
 from sparkos.agent.memory import list_sessions
+from sparkos.ui.runtime_panel import RuntimePanel
 
 
 class HistoryScreen(Screen):
@@ -69,10 +70,16 @@ class HistoryScreen(Screen):
         if app.runtime.context.load_session(session_id):
             chat = app.query_one("#chat", VerticalScroll)
             await chat.remove_children()
+            app.query_one("#runtime-panel", RuntimePanel).reset()
+            app.query_one("#status", Static).update("已加载历史会话")
             app._slash_hint.update("")
             for msg in app.runtime.context.history:
                 if msg.role == "user":
-                    widget = Static(f"你：{msg.content}", classes="user-message")
+                    widget = Static(
+                        f"你：{msg.content}",
+                        classes="user-message",
+                        markup=False,
+                    )
                 elif msg.role == "assistant" and msg.content:
                     widget = Markdown(msg.content, classes="assistant-message")
                 else:

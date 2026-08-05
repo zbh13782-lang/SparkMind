@@ -18,6 +18,13 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
+class ClarificationRequest:
+    """A planner decision that execution must wait for missing user input."""
+
+    question: str
+
+
+@dataclass(frozen=True)
 class PlanStep:
     description: str
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -97,7 +104,7 @@ class Planner(Protocol):
         self,
         task: AgentTask,
         context: PlanningContext,
-    ) -> Plan | None:
+    ) -> Plan | ClarificationRequest | None:
         """Return a plan or None when direct execution is appropriate."""
         ...
 
@@ -117,6 +124,7 @@ class Replanner(Protocol):
 
 
 __all__ = [
+    "ClarificationRequest",
     "Plan",
     "PlanStep",
     "Planner",

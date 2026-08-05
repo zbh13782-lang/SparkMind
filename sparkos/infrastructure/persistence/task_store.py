@@ -29,7 +29,7 @@ class JsonTaskStore:
     def save(
         self,
         task: AgentTask,
-        plan: Plan,
+        plan: Plan | None,
         step_runs: dict[str, StepRun],
     ) -> None:
         if _SAFE_TASK_ID.fullmatch(task.id) is None:
@@ -37,7 +37,7 @@ class JsonTaskStore:
         self.root.mkdir(parents=True, exist_ok=True)
         target = self.root / f"{task.id}.json"
         temporary = self.root / f".{task.id}.{uuid.uuid4().hex}.tmp"
-        serialized_plan = self._serialize_plan(plan)
+        serialized_plan = self._serialize_plan(plan) if plan is not None else None
         plan_history: list[dict[str, Any]] = []
         if target.is_file():
             previous = json.loads(target.read_text(encoding="utf-8"))
@@ -82,6 +82,7 @@ class JsonTaskStore:
             "active_plan_id": task.active_plan_id,
             "result": task.result,
             "error": task.error,
+            "clarification_question": task.clarification_question,
         }
 
     @classmethod

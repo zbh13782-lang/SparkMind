@@ -28,6 +28,12 @@ class PlanReplanned:
 
 
 @dataclass(frozen=True)
+class ClarificationRequested:
+    task: AgentTask
+    question: str
+
+
+@dataclass(frozen=True)
 class TextDelta:
     text: str
 
@@ -85,6 +91,7 @@ class TaskFailed:
 
 type AgentEvent = (
     TaskStarted
+    | ClarificationRequested
     | PlanCreated
     | PlanReplanned
     | StepStarted
@@ -102,6 +109,7 @@ type AgentEvent = (
 
 __all__ = [
     "AgentEvent",
+    "ClarificationRequested",
     "PlanCreated",
     "PlanReplanned",
     "StepCompleted",

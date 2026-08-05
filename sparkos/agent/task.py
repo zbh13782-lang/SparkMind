@@ -34,9 +34,19 @@ class AgentTask:
     active_plan_id: str | None = None
     result: str | None = None
     error: str | None = None
+    clarification_question: str | None = None
 
     def start_planning(self) -> None:
         self.status = TaskStatus.PLANNING
+        self.error = None
+        self.clarification_question = None
+
+    def wait_for_input(self, question: str) -> None:
+        normalized = question.strip()
+        if not normalized:
+            raise ValueError("澄清问题不能为空")
+        self.status = TaskStatus.WAITING_INPUT
+        self.clarification_question = normalized
         self.error = None
 
     def start(self) -> None:

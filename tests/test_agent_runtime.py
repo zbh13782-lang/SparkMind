@@ -8,6 +8,7 @@ from unittest.mock import Mock
 
 from sparkos.agent.context import WINDOW, AgentContext
 from sparkos.agent.events import (
+    ClarificationRequested,
     PlanCreated,
     PlanReplanned,
     StepCompleted,
@@ -21,7 +22,7 @@ from sparkos.agent.events import (
     TaskStarted,
     TextDelta,
 )
-from sparkos.agent.planner import Plan, PlanStep
+from sparkos.agent.planner import ClarificationRequest, Plan, PlanStep
 from sparkos.agent.runtime import AgentRuntime
 from sparkos.agent.skills.loader import Skill
 from sparkos.agent.step import StepRun, StepStatus, StepVerification
@@ -70,6 +71,25 @@ class FakePlanner:
             version=self.plan.version,
             source=self.plan.source,
         )
+
+
+class FakeClarifyingPlanner:
+    def __init__(self, question: str) -> None:
+        self.question = question
+
+    async def create_plan(
+        self,
+        task: AgentTask,
+        context: object,
+    ) -> ClarificationRequest:
+        del task, context
+        return ClarificationRequest(self.question)
+
+
+class FailingPlanner:
+    async def create_plan(self, task: AgentTask, context: object) -> Plan | None:
+        del task, context
+        raise RuntimeError("planner unavailable")
 
 
 class FakeVerifier:
@@ -130,14 +150,14 @@ class FakeTaskStore:
     def save(
         self,
         task: AgentTask,
-        plan: Plan,
+        plan: Plan | None,
         step_runs: dict[str, StepRun],
     ) -> None:
         self.snapshots.append(
             {
                 "task_status": task.status,
                 "task_result": task.result,
-                "plan_id": plan.id,
+                "plan_id": plan.id if plan is not None else None,
                 "step_statuses": {
                     step_id: run.status for step_id, run in step_runs.items()
                 },
@@ -228,6 +248,40 @@ async def collect_events(runtime: AgentRuntime, task: AgentTask) -> list[object]
 
 
 class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_planner_can_pause_task_and_ask_for_clarification(self) -> None:
+        context = context_without_disk()
+        store = FakeTaskStore()
+        client = FakeClient(turns=[])
+        runtime = AgentRuntime(
+            context=context,
+            client=client,
+            planner=FakeClarifyingPlanner("请提供要分析的文件路径。"),
+            skills=[],
+            tools=[],
+            task_store=store,
+        )
+        task = AgentTask(goal="帮我分析一下")
+
+        events = await collect_events(runtime, task)
+
+        self.assertEqual(
+            [type(event) for event in events],
+            [TaskStarted, ClarificationRequested],
+        )
+        clarification = events[-1]
+        assert isinstance(clarification, ClarificationRequested)
+        self.assertEqual(clarification.question, "请提供要分析的文件路径。")
+        self.assertEqual(task.status, TaskStatus.WAITING_INPUT)
+        self.assertEqual(client.requests, [])
+        self.assertEqual(
+            [(message.role, message.content) for message in context.history],
+            [
+                ("user", "帮我分析一下"),
+                ("assistant", "请提供要分析的文件路径。"),
+            ],
+        )
+        self.assertEqual(store.snapshots[-1]["plan_id"], None)
+
     async def test_runtime_rejects_more_than_one_replan(self) -> None:
         with self.assertRaisesRegex(ValueError, "最多允许 1 次"):
             AgentRuntime(
@@ -266,7 +320,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [event.text for event in events if isinstance(event, TextDelta)],
-            ["hello world"],
+            ["hello", " world"],
         )
         self.assertIsInstance(events[-1], TaskCompleted)
         self.assertEqual(task.status, TaskStatus.SUCCEEDED)
@@ -282,7 +336,9 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         planner = FakePlanner(two_step_plan())
-        client = FakeClient(turns=[["inspected"], ["report data"], ["final answer"]])
+        client = FakeClient(
+            turns=[["inspected"], ["report data"], ["final ", "answer"]]
+        )
         store = FakeTaskStore()
         runtime = AgentRuntime(
             context=context_without_disk(),
@@ -312,7 +368,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [event.text for event in events if isinstance(event, TextDelta)],
-            ["final answer"],
+            ["final ", "answer"],
         )
         self.assertEqual(task.result, "final answer")
         self.assertEqual(
@@ -362,6 +418,54 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(task.result, "final report")
         self.assertNotIn("<tool_call>", runtime.context.history[-1].content)
+
+    async def test_direct_answer_rejects_textual_tool_call_markup(self) -> None:
+        runtime = AgentRuntime(
+            context=context_without_disk(),
+            client=FakeClient(
+                turns=[
+                    [
+                        "<tool_call>",
+                        "<tool_name>web_fetch</tool_name></tool_call>",
+                    ]
+                ]
+            ),
+            skills=[],
+            tools=[],
+            task_store=FakeTaskStore(),
+        )
+        task = AgentTask(goal="weather")
+
+        events = await collect_events(runtime, task)
+
+        deltas = [event.text for event in events if isinstance(event, TextDelta)]
+        self.assertEqual(deltas, ["未能生成有效的最终回答，请重试。"])
+        self.assertNotIn("<tool_call", task.result or "")
+        self.assertNotIn("<tool_call", runtime.context.history[-1].content)
+
+    async def test_planned_answer_rejects_unclosed_textual_tool_call(self) -> None:
+        runtime = AgentRuntime(
+            context=context_without_disk(),
+            client=FakeClient(
+                turns=[
+                    ["inspected"],
+                    ["final report"],
+                    ["<tool_", "call><tool_name>web_fetch"],
+                ]
+            ),
+            planner=FakePlanner(two_step_plan()),
+            skills=[],
+            tools=[],
+            task_store=FakeTaskStore(),
+        )
+        task = AgentTask(goal="analyze")
+
+        events = await collect_events(runtime, task)
+
+        deltas = [event.text for event in events if isinstance(event, TextDelta)]
+        self.assertEqual(deltas, ["final report"])
+        self.assertEqual(task.result, "final report")
+        self.assertNotIn("<tool_call", runtime.context.history[-1].content)
 
     async def test_verifier_rejection_retries_once_with_feedback(self) -> None:
         verifier = FakeVerifier(
@@ -849,9 +953,7 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await collect_events(runtime, AgentTask(goal="what happened?"))
 
         replayed_history = [
-            message
-            for message in client.requests[2]
-            if message["role"] != "system"
+            message for message in client.requests[2] if message["role"] != "system"
         ]
         self.assertEqual(
             [message["role"] for message in replayed_history],
@@ -1050,12 +1152,13 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_closing_event_stream_after_task_started_cancels_task(self) -> None:
         task = AgentTask(goal="start")
+        store = FakeTaskStore()
         runtime = AgentRuntime(
             context=context_without_disk(),
             client=FakeClient(turns=[]),
             skills=[],
             tools=[],
-            task_store=FakeTaskStore(),
+            task_store=store,
         )
         stream = runtime.run(task)
 
@@ -1064,6 +1167,27 @@ class AgentRuntimeTests(unittest.IsolatedAsyncioTestCase):
         await stream.aclose()
 
         self.assertEqual(task.status, TaskStatus.CANCELLED)
+        self.assertEqual(store.snapshots[-1]["task_status"], TaskStatus.CANCELLED)
+        self.assertIsNone(store.snapshots[-1]["plan_id"])
+
+    async def test_planner_failure_persists_failed_task_without_plan(self) -> None:
+        task = AgentTask(goal="start")
+        store = FakeTaskStore()
+        runtime = AgentRuntime(
+            context=context_without_disk(),
+            client=FakeClient(turns=[]),
+            planner=FailingPlanner(),
+            skills=[],
+            tools=[],
+            task_store=store,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "planner unavailable"):
+            await collect_events(runtime, task)
+
+        self.assertEqual(task.status, TaskStatus.FAILED)
+        self.assertEqual(store.snapshots[-1]["task_status"], TaskStatus.FAILED)
+        self.assertIsNone(store.snapshots[-1]["plan_id"])
 
     async def test_cancelling_verifier_call_cancels_verifying_step_snapshot(
         self,

@@ -44,6 +44,23 @@ def base_messages() -> list[ChatMessage]:
 
 
 class StepExecutorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_execution_preserves_final_assistant_chunks(self) -> None:
+        executor = StepExecutor(
+            client=FakeStepClient(turns=[["hello", " ", "world"]]),
+            tools=[],
+            tool_executor=None,
+        )
+
+        execution = await executor.execute(
+            task=AgentTask(goal="greet"),
+            step=sample_step(),
+            dependency_results={},
+            base_messages=base_messages(),
+        )
+
+        self.assertEqual(execution.text_chunks, ("hello", " ", "world"))
+        self.assertEqual(execution.result.output, "hello world")
+
     async def test_executor_injects_current_step_and_dependency_results(self) -> None:
         client = FakeStepClient(turns=[["analysis done"]])
         executor = StepExecutor(client=client, tools=[], tool_executor=None)
