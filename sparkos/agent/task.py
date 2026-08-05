@@ -14,7 +14,9 @@ from typing import Any
 
 class TaskStatus(StrEnum):
     PENDING = "pending"
+    PLANNING = "planning"
     RUNNING = "running"
+    WAITING_INPUT = "waiting_input"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     CANCELLED = "cancelled"
@@ -32,6 +34,10 @@ class AgentTask:
     active_plan_id: str | None = None
     result: str | None = None
     error: str | None = None
+
+    def start_planning(self) -> None:
+        self.status = TaskStatus.PLANNING
+        self.error = None
 
     def start(self) -> None:
         self.status = TaskStatus.RUNNING

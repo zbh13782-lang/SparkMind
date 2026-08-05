@@ -4,7 +4,9 @@ import json
 import unittest
 
 from sparkos.agent.llm_planner import LLMPlanner
-from sparkos.agent.planner import PlanningContext
+from sparkos.agent.planner import Plan, PlanningContext, PlanStep, SkillCapability
+from sparkos.agent.scheduler import create_step_runs
+from sparkos.agent.step import StepResult, StepVerification
 from sparkos.agent.task import AgentTask
 from sparkos.infrastructure.llm.models import ChatMessage
 
@@ -24,7 +26,12 @@ def planning_context() -> PlanningContext:
         session_id="session-1",
         summary="Earlier the user selected sales.csv.",
         recent_messages=(ChatMessage(role="user", content="analyze it"),),
-        skill_names=("spark-sql",),
+        skills=(
+            SkillCapability(
+                name="spark-sql",
+                description="Generate and optimize Spark SQL",
+            ),
+        ),
         tool_names=("read_file", "shell"),
     )
 
@@ -40,11 +47,13 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
                             "id": "s1",
                             "description": "Inspect the input data",
                             "depends_on": [],
+                            "success_criteria": "Input schema is known",
                         },
                         {
                             "id": "s2",
                             "description": "Write the findings",
                             "depends_on": ["s1"],
+                            "success_criteria": "Findings are summarized",
                         },
                     ],
                 }
@@ -58,7 +67,8 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
         assert plan is not None
         self.assertEqual(plan.task_id, task.id)
         self.assertEqual([step.id for step in plan.steps], ["s1", "s2"])
-        self.assertEqual(plan.steps[1].depends_on, ["s1"])
+        self.assertEqual(plan.steps[1].depends_on, ("s1",))
+        self.assertEqual(plan.steps[1].success_criteria, "Findings are summarized")
 
     async def test_simple_task_returns_none(self) -> None:
         model = FakePlanningModel('{"should_plan": false, "steps": []}')
@@ -201,9 +211,106 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["goal"], "Analyze sales")
         self.assertEqual(payload["input"], {"format": "csv"})
         self.assertIn("sales.csv", payload["summary"])
-        self.assertEqual(payload["skills"], ["spark-sql"])
+        self.assertEqual(
+            payload["skills"],
+            [
+                {
+                    "name": "spark-sql",
+                    "description": "Generate and optimize Spark SQL",
+                }
+            ],
+        )
         self.assertEqual(payload["tools"], ["read_file", "shell"])
         self.assertEqual(payload["recent_messages"][0]["content"], "analyze it")
+
+    async def test_revise_plan_increments_version_and_includes_failure_state(
+        self,
+    ) -> None:
+        model = FakePlanningModel(
+            json.dumps(
+                {
+                    "should_plan": True,
+                    "steps": [
+                        {
+                            "id": "s1",
+                            "description": "Inspect input",
+                            "depends_on": [],
+                            "success_criteria": "Input inspected",
+                        },
+                        {
+                            "id": "s3",
+                            "description": "Use fallback source",
+                            "depends_on": ["s1"],
+                            "success_criteria": "Fallback report complete",
+                        },
+                    ],
+                }
+            )
+        )
+        task = AgentTask(goal="Analyze")
+        failed_step = PlanStep(
+            id="s2",
+            description="Use primary source",
+            depends_on=("s1",),
+            success_criteria="Report complete",
+        )
+        current_plan = Plan(
+            id="plan-1",
+            task_id=task.id,
+            version=1,
+            steps=(
+                PlanStep(
+                    id="s1",
+                    description="Inspect input",
+                    success_criteria="Input inspected",
+                ),
+                failed_step,
+            ),
+        )
+        runs = create_step_runs(current_plan)
+        runs["s1"].start()
+        runs["s1"].succeed(StepResult(True, "schema loaded"))
+        runs["s2"].start()
+        runs["s2"].begin_verification(StepResult(True, "source blocked"))
+        runs["s2"].record_verification(
+            StepVerification(False, "primary source incomplete", True)
+        )
+        runs["s2"].prepare_retry()
+        runs["s2"].start()
+        runs["s2"].begin_verification(StepResult(True, "source still blocked"))
+        runs["s2"].record_verification(
+            StepVerification(False, "primary source blocked", False)
+        )
+
+        revised = await LLMPlanner(model).revise_plan(
+            task=task,
+            context=planning_context(),
+            current_plan=current_plan,
+            step_runs=runs,
+            failed_step=failed_step,
+            reason="primary source blocked",
+        )
+
+        self.assertIsNotNone(revised)
+        assert revised is not None
+        self.assertEqual(revised.version, 2)
+        self.assertEqual(revised.source, "replan")
+        self.assertEqual([step.id for step in revised.steps], ["s1", "s3"])
+        payload = json.loads(model.requests[0][1]["content"])
+        self.assertEqual(payload["failed_step"]["id"], "s2")
+        self.assertEqual(payload["failure_reason"], "primary source blocked")
+        self.assertEqual(
+            payload["step_runs"]["s1"]["result"]["output"],
+            "schema loaded",
+        )
+        self.assertEqual(
+            payload["step_runs"]["s2"]["result_history"][0]["output"],
+            "source blocked",
+        )
+        self.assertEqual(
+            payload["step_runs"]["s2"]["verification_history"][0]["reason"],
+            "primary source incomplete",
+        )
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ from sparkos.infrastructure.llm.models import ChatMessage
 
 _SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
 
+# 最多可见短期窗口数
 WINDOW = 12
 
 _COMPACT_PROMPT = """你是一个对话记忆压缩器。下面是某段对话的早期内容，以及（可能存在的）之前已压缩的摘要。

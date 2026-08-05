@@ -1,32 +1,66 @@
-"""Agent task orchestration and model/tool execution loop."""
+"""Agent task orchestration across planning, step execution, and synthesis."""
 
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
-from typing import Any, Protocol
+from collections.abc import AsyncIterator
+from dataclasses import replace
+from typing import Any, Protocol, cast
 
 from sparkos.agent.context import WINDOW, AgentContext
 from sparkos.agent.events import (
     AgentEvent,
     PlanCreated,
+    PlanReplanned,
+    StepCompleted,
+    StepFailed,
+    StepRetrying,
+    StepStarted,
+    StepToolCompleted,
+    StepVerificationCompleted,
     TaskCompleted,
     TaskFailed,
     TaskStarted,
     TextDelta,
-    ToolCompleted,
 )
 from sparkos.agent.llm_planner import LLMPlanner
-from sparkos.agent.planner import Plan, Planner, PlanningContext
+from sparkos.agent.planner import (
+    Plan,
+    Planner,
+    PlanningContext,
+    PlanStep,
+    Replanner,
+    SkillCapability,
+)
+from sparkos.agent.retry import RetryPolicy
+from sparkos.agent.scheduler import (
+    PlanScheduler,
+    create_direct_plan,
+    create_step_runs,
+)
 from sparkos.agent.skills.loader import Skill, load_skills
+from sparkos.agent.step import (
+    StepResult,
+    StepRun,
+    StepStatus,
+    StepVerification,
+)
+from sparkos.agent.step_executor import (
+    StepExecution,
+    StepExecutionError,
+    StepExecutor,
+    StepToolExecution,
+    StepTranscriptUpdate,
+    ToolExecutor,
+)
 from sparkos.agent.task import AgentTask
+from sparkos.agent.task_store import TaskStore
 from sparkos.agent.tools.registry import TOOL_DEFINITIONS, execute_tool
+from sparkos.agent.verifier import LLMStepVerifier, StepVerifier
 from sparkos.infrastructure.llm.client import OpenAIChatClient
 from sparkos.infrastructure.llm.models import ChatConfig, ChatMessage, ToolCall
-
-ToolExecutor = Callable[[str, dict[str, Any]], str | Awaitable[str]]
+from sparkos.infrastructure.persistence.task_store import JsonTaskStore
 
 
 class ModelClient(Protocol):
@@ -40,7 +74,7 @@ class ModelClient(Protocol):
 
 
 class AgentRuntime:
-    """Execute independent AgentTask objects against one conversation context."""
+    """Own the lifecycle of one task while sharing a conversation context."""
 
     def __init__(
         self,
@@ -54,9 +88,21 @@ class AgentRuntime:
         planner: Planner | None = None,
         enable_planning: bool = False,
         max_tool_rounds: int = 8,
+        task_store: TaskStore | None = None,
+        scheduler: PlanScheduler | None = None,
+        step_executor: StepExecutor | None = None,
+        verifier: StepVerifier | None = None,
+        enable_verification: bool = False,
+        retry_policy: RetryPolicy | None = None,
+        replanner: Replanner | None = None,
+        max_replans: int = 1,
     ) -> None:
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds 不能小于 0")
+        if max_replans < 0:
+            raise ValueError("max_replans 不能小于 0")
+        if max_replans > 1:
+            raise ValueError("每个任务最多允许 1 次重规划")
 
         self.config = config or ChatConfig.from_yaml()
         self.context = context or AgentContext()
@@ -66,135 +112,438 @@ class AgentRuntime:
         self.tool_executor = tool_executor
         self.planner = planner or (LLMPlanner(self.client) if enable_planning else None)
         self.max_tool_rounds = max_tool_rounds
+        self.task_store = task_store if task_store is not None else JsonTaskStore()
+        self.scheduler = scheduler or PlanScheduler()
+        self.step_executor = step_executor or StepExecutor(
+            client=self.client,
+            tools=self.tools,
+            tool_executor=self.tool_executor,
+            max_tool_rounds=max_tool_rounds,
+        )
+        self.verifier = verifier or (
+            LLMStepVerifier(self.client) if enable_verification else None
+        )
+        self.retry_policy = retry_policy or RetryPolicy(max_attempts=2)
+        if replanner is not None:
+            self.replanner = replanner
+        elif self.planner is not None and hasattr(self.planner, "revise_plan"):
+            self.replanner = cast(Replanner, self.planner)
+        else:
+            self.replanner = None
+        self.max_replans = max_replans
 
     async def run(
         self,
         task: AgentTask,
         skill_name: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
-        """Run one task and emit lifecycle, text, planning, and tool events."""
-        task.start()
-        self.context.record_user(task.goal)
-        self.context.ensure_session()
-        yield TaskStarted(task)
+        """Plan and execute one task, emitting task- and step-scoped events."""
+        plan: Plan | None = None
+        step_runs: dict[str, StepRun] = {}
+        active_run: StepRun | None = None
+        retry_feedback_by_step: dict[str, str] = {}
+        replan_count = 0
 
         try:
+            task.start_planning()
+            self.context.record_user(task.goal)
+            self.context.ensure_session()
+            yield TaskStarted(task)
+
             await self._compact_if_needed()
 
-            plan: Plan | None = None
             if self.planner is not None:
                 plan = await self.planner.create_plan(task, self._planning_context())
-                if plan is not None:
-                    task.active_plan_id = plan.id
-                    yield PlanCreated(plan)
+            if plan is None:
+                plan = create_direct_plan(task)
 
-            messages = self.context.build_messages(
+            task.active_plan_id = plan.id
+            step_runs = create_step_runs(plan)
+            self._save_task(task, plan, step_runs)
+            yield PlanCreated(plan)
+
+            task.start()
+            self._save_task(task, plan, step_runs)
+            base_messages = self.context.build_messages(
                 skills=self.skills,
                 tools=self.tools,
                 skill_name=skill_name,
             )
-            if plan is not None:
-                self._inject_plan(messages, plan)
-            answer_parts: list[str] = []
-            tool_rounds = 0
 
-            while True:
-                turn_parts: list[str] = []
-                tool_calls: list[ToolCall] = []
+            while not self.scheduler.is_complete(step_runs):
+                self.scheduler.block_failed_dependents(plan, step_runs)
+                if self.scheduler.has_failed(step_runs):
+                    self._save_task(task, plan, step_runs)
+                    raise RuntimeError("计划包含失败或被阻塞的步骤")
 
-                async for item in self.client.chat_stream(
-                    messages,
-                    tools=self.tools or None,
-                ):
-                    if isinstance(item, str):
-                        turn_parts.append(item)
-                        answer_parts.append(item)
-                        yield TextDelta(item)
-                    else:
-                        tool_calls.append(item)
+                ready_steps = self.scheduler.ready_steps(plan, step_runs)
+                if not ready_steps:
+                    raise RuntimeError("计划无可执行步骤，请检查依赖关系")
 
-                turn_text = "".join(turn_parts)
-                serialized_calls = (
-                    [tool_call.to_api_dict() for tool_call in tool_calls]
-                    if tool_calls
-                    else None
-                )
-                assistant_message = ChatMessage(
-                    role="assistant",
-                    content=turn_text,
-                    tool_calls=serialized_calls,
-                )
-                self.context.record_assistant(turn_text, serialized_calls)
-                messages.append(assistant_message)
+                # Phase 1 intentionally executes one ready step at a time. The
+                # scheduler API already leaves room for parallel execution later.
+                step = ready_steps[0]
+                run = step_runs[step.id]
+                run.start()
+                active_run = run
+                self._save_task(task, plan, step_runs)
+                yield StepStarted(step)
 
-                if not tool_calls:
-                    break
+                dependency_results = {
+                    dependency: step_runs[dependency].result
+                    for dependency in step.depends_on
+                    if step_runs[dependency].result is not None
+                }
+                retry_feedback = retry_feedback_by_step.pop(step.id, None)
+                execution: StepExecution | None = None
+                try:
+                    async for update in self.step_executor.stream(
+                        task=task,
+                        step=step,
+                        dependency_results=dependency_results,
+                        base_messages=base_messages,
+                        retry_feedback=retry_feedback,
+                    ):
+                        if isinstance(update, StepTranscriptUpdate):
+                            run.record_transcript(update.transcript)
+                            self._save_task(task, plan, step_runs)
+                        elif isinstance(update, StepToolExecution):
+                            run.record_transcript(update.transcript)
+                            self._save_task(task, plan, step_runs)
+                            yield StepToolCompleted(
+                                step=step,
+                                tool_call=update.tool_call,
+                            )
+                        else:
+                            execution = update
+                except Exception as exc:
+                    error = str(exc)
+                    if isinstance(exc, StepExecutionError):
+                        run.record_transcript(exc.transcript)
+                    run.fail(error)
+                    active_run = None
+                    self._save_task(task, plan, step_runs)
+                    yield StepFailed(step=step, error=error)
+                    raise
 
-                if tool_rounds >= self.max_tool_rounds:
-                    error = f"工具调用轮数超过限制（{self.max_tool_rounds}）"
-                    for tool_call in tool_calls:
-                        tool_call.result = error
-                        self._record_tool_result(messages, tool_call)
-                        yield ToolCompleted(tool_call)
+                if execution is None:
+                    error = "步骤执行未返回结果"
+                    run.fail(error)
+                    active_run = None
+                    self._save_task(task, plan, step_runs)
+                    yield StepFailed(step=step, error=error)
                     raise RuntimeError(error)
 
-                tool_rounds += 1
-                for tool_call in tool_calls:
-                    tool_call.result = await self._execute_tool_call(tool_call)
-                    self._record_tool_result(messages, tool_call)
-                    yield ToolCompleted(tool_call)
+                run.record_transcript(execution.transcript)
 
-            task.succeed("".join(answer_parts))
+                if not execution.result.success:
+                    error = execution.result.error or "步骤执行失败"
+                    run.fail(error, execution.result)
+                    active_run = None
+                    self.scheduler.block_failed_dependents(plan, step_runs)
+                    self._save_task(task, plan, step_runs)
+                    yield StepFailed(step=step, error=error)
+                    raise RuntimeError(error)
+
+                accepted_result = execution.result
+                if self.verifier is not None:
+                    run.begin_verification(accepted_result)
+                    self._save_task(task, plan, step_runs)
+                    try:
+                        verification = await self.verifier.verify(
+                            task=task,
+                            step=step,
+                            result=accepted_result,
+                            dependency_results=dependency_results,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        verification = StepVerification(
+                            passed=True,
+                            reason="验证器不可用，按兼容策略放行",
+                            retryable=False,
+                            error=f"{type(exc).__name__}: {exc}",
+                        )
+                    run.record_verification(verification)
+                    self._save_task(task, plan, step_runs)
+                    yield StepVerificationCompleted(
+                        step=step,
+                        verification=verification,
+                    )
+
+                    if not verification.passed:
+                        error = verification.reason
+                        if self.retry_policy.should_retry(run, verification):
+                            next_attempt = run.attempt_count + 1
+                            run.prepare_retry()
+                            active_run = None
+                            retry_feedback_by_step[step.id] = error
+                            self._save_task(task, plan, step_runs)
+                            yield StepRetrying(
+                                step=step,
+                                attempt=next_attempt,
+                                reason=error,
+                            )
+                            continue
+
+                        run.fail(error, accepted_result)
+                        active_run = None
+                        self.scheduler.block_failed_dependents(plan, step_runs)
+                        self._save_task(task, plan, step_runs)
+                        yield StepFailed(step=step, error=error)
+                        if (
+                            self.replanner is not None
+                            and replan_count < self.max_replans
+                        ):
+                            revised_plan = await self._revise_plan(
+                                task=task,
+                                plan=plan,
+                                step_runs=step_runs,
+                                failed_step=step,
+                                reason=error,
+                            )
+                            if revised_plan is not None:
+                                previous_plan = plan
+                                step_runs = self._reconcile_step_runs(
+                                    previous_plan,
+                                    revised_plan,
+                                    step_runs,
+                                )
+                                plan = revised_plan
+                                task.active_plan_id = plan.id
+                                retry_feedback_by_step.clear()
+                                replan_count += 1
+                                self._save_task(task, plan, step_runs)
+                                yield PlanReplanned(
+                                    previous_plan=previous_plan,
+                                    plan=plan,
+                                    reason=error,
+                                )
+                                continue
+                        raise RuntimeError(error)
+
+                    evidence = tuple(
+                        dict.fromkeys(
+                            (*accepted_result.evidence, *verification.evidence)
+                        )
+                    )
+                    accepted_result = replace(
+                        accepted_result,
+                        evidence=evidence,
+                    )
+
+                run.succeed(accepted_result)
+                active_run = None
+                self._save_task(task, plan, step_runs)
+                yield StepCompleted(step=step, result=accepted_result)
+
+            if plan.source == "direct":
+                final_answer = step_runs[plan.steps[0].id].result
+                answer = final_answer.output if final_answer is not None else ""
+                if answer:
+                    yield TextDelta(answer)
+            else:
+                answer_parts: list[str] = []
+                async for delta in self._synthesize_final(
+                    task=task,
+                    plan=plan,
+                    step_runs=step_runs,
+                    base_messages=base_messages,
+                ):
+                    answer_parts.append(delta)
+                answer = "".join(answer_parts).strip()
+                if not answer or self._is_textual_tool_call(answer):
+                    answer = self._fallback_answer(plan, step_runs)
+                if answer:
+                    yield TextDelta(answer)
+
+            task.succeed(answer)
+            self.context.record_assistant(answer)
             self.context.persist()
+            self._save_task(task, plan, step_runs)
             yield TaskCompleted(task)
 
+        except GeneratorExit:
+            task.cancel()
+            if active_run is not None and active_run.status in {
+                StepStatus.RUNNING,
+                StepStatus.VERIFYING,
+            }:
+                active_run.cancel()
+            self.context.persist()
+            if plan is not None:
+                self._save_task_best_effort(task, plan, step_runs)
+            return
         except asyncio.CancelledError:
             task.cancel()
+            if active_run is not None and active_run.status in {
+                StepStatus.RUNNING,
+                StepStatus.VERIFYING,
+            }:
+                active_run.cancel()
             self.context.persist()
+            if plan is not None:
+                self._save_task_best_effort(task, plan, step_runs)
             raise
         except Exception as exc:
             task.fail(str(exc))
             self.context.persist()
+            if plan is not None:
+                self._save_task_best_effort(task, plan, step_runs)
             yield TaskFailed(task)
             raise
 
-    def _record_tool_result(
+    async def _synthesize_final(
         self,
+        task: AgentTask,
+        plan: Plan,
+        step_runs: dict[str, StepRun],
+        base_messages: list[ChatMessage],
+    ) -> AsyncIterator[str]:
+        messages = list(base_messages)
+        payload = {
+            "task_goal": task.goal,
+            "task_input": task.input,
+            "step_results": [
+                {
+                    "step_id": step.id,
+                    "description": step.description,
+                    "result": self._serialize_result(step_runs[step.id].result),
+                }
+                for step in plan.steps
+            ],
+        }
+        self._insert_system_message(
+            messages,
+            "所有计划步骤已完成。请基于 step_results 给出直接、完整的最终答案，"
+            "不要暴露内部执行过程。\n"
+            f"{json.dumps(payload, ensure_ascii=False, default=repr)}",
+        )
+        async for item in self.client.chat_stream(messages, tools=None):
+            if isinstance(item, ToolCall):
+                raise TypeError("最终结果汇总阶段不允许调用工具")
+            yield item
+
+    @staticmethod
+    def _serialize_result(result: StepResult | None) -> dict[str, Any] | None:
+        if result is None:
+            return None
+        return {
+            "success": result.success,
+            "output": result.output,
+            "evidence": list(result.evidence),
+            "artifacts": [
+                {"uri": artifact.uri, "kind": artifact.kind}
+                for artifact in result.artifacts
+            ],
+            "error": result.error,
+        }
+
+    @staticmethod
+    def _fallback_answer(plan: Plan, step_runs: dict[str, StepRun]) -> str:
+        for step in reversed(plan.steps):
+            result = step_runs[step.id].result
+            if result is not None and result.output:
+                return result.output
+        return ""
+
+    @staticmethod
+    def _is_textual_tool_call(text: str) -> bool:
+        normalized = text.lstrip().casefold()
+        return normalized.startswith("<tool_call") and "</tool_call>" in normalized
+
+    @staticmethod
+    def _insert_system_message(
         messages: list[ChatMessage],
-        tool_call: ToolCall,
+        content: str,
     ) -> None:
-        self.context.record_tool(tool_call.call_id, tool_call.result)
-        messages.append(
-            ChatMessage(
-                role="tool",
-                content=tool_call.result,
-                tool_call_id=tool_call.call_id,
-            )
+        insertion_index = next(
+            (
+                index
+                for index, message in enumerate(messages)
+                if message.role != "system"
+            ),
+            len(messages),
+        )
+        messages.insert(
+            insertion_index,
+            ChatMessage(role="system", content=content),
         )
 
-    async def _execute_tool_call(self, tool_call: ToolCall) -> str:
-        if self.tool_executor is None:
-            return "工具执行失败：未配置工具执行器"
+    def _save_task(
+        self,
+        task: AgentTask,
+        plan: Plan,
+        step_runs: dict[str, StepRun],
+    ) -> None:
+        self.task_store.save(task, plan, step_runs)
 
+    async def _revise_plan(
+        self,
+        task: AgentTask,
+        plan: Plan,
+        step_runs: dict[str, StepRun],
+        failed_step: PlanStep,
+        reason: str,
+    ) -> Plan | None:
+        assert self.replanner is not None
         try:
-            arguments = json.loads(tool_call.arguments or "{}")
-        except json.JSONDecodeError as exc:
-            return f"工具参数不是有效 JSON：{exc}"
+            revised = await self.replanner.revise_plan(
+                task=task,
+                context=self._planning_context(),
+                current_plan=plan,
+                step_runs=step_runs,
+                failed_step=failed_step,
+                reason=reason,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        if revised is None:
+            return None
+        if revised.task_id != task.id:
+            return None
+        if revised.id == plan.id:
+            return None
+        if revised.version != plan.version + 1:
+            return None
+        if revised.source != "replan":
+            return None
+        for revised_step in revised.steps:
+            if revised_step.id == failed_step.id:
+                return None
+        return revised
 
-        try:
-            if inspect.iscoroutinefunction(self.tool_executor):
-                result = await self.tool_executor(tool_call.name, arguments)
+    @staticmethod
+    def _reconcile_step_runs(
+        previous_plan: Plan,
+        revised_plan: Plan,
+        previous_runs: dict[str, StepRun],
+    ) -> dict[str, StepRun]:
+        previous_steps = {step.id: step for step in previous_plan.steps}
+        reconciled: dict[str, StepRun] = {}
+        for step in revised_plan.steps:
+            previous_run = previous_runs.get(step.id)
+            if (
+                previous_run is not None
+                and previous_run.status == StepStatus.SUCCEEDED
+                and previous_steps.get(step.id) == step
+            ):
+                reconciled[step.id] = previous_run
             else:
-                result = await asyncio.to_thread(
-                    self.tool_executor,
-                    tool_call.name,
-                    arguments,
-                )
-            if inspect.isawaitable(result):
-                result = await result
-            return str(result)
-        except Exception as exc:  # noqa: BLE001
-            return f"工具执行失败：{type(exc).__name__}: {exc}"
+                reconciled[step.id] = StepRun(step_id=step.id)
+        return reconciled
+
+    def _save_task_best_effort(
+        self,
+        task: AgentTask,
+        plan: Plan,
+        step_runs: dict[str, StepRun],
+    ) -> None:
+        try:
+            self._save_task(task, plan, step_runs)
+        except Exception:  # noqa: BLE001
+            # Preserve the original execution/cancellation exception. A failed
+            # primary snapshot save has already made the task fail.
+            return
 
     async def _compact_if_needed(self) -> bool:
         request = self.context.build_compaction_request()
@@ -218,41 +567,15 @@ class AgentRuntime:
             session_id=self.context.session_id,
             summary=self.context.summary,
             recent_messages=tuple(self.context.history[self.context.summary_upto :]),
-            skill_names=tuple(skill.name for skill in self.skills),
+            skills=tuple(
+                SkillCapability(
+                    name=skill.name,
+                    description=skill.description,
+                )
+                for skill in self.skills
+            ),
             tool_names=tool_names,
         )
-
-    @staticmethod
-    def _inject_plan(messages: list[ChatMessage], plan: Plan) -> None:
-        plan_payload = {
-            "plan_id": plan.id,
-            "version": plan.version,
-            "steps": [
-                {
-                    "id": step.id,
-                    "description": step.description,
-                    "depends_on": step.depends_on,
-                }
-                for step in plan.steps
-            ],
-        }
-        plan_message = ChatMessage(
-            role="system",
-            content=(
-                "当前任务已生成以下执行计划。请遵守依赖关系逐步执行；"
-                "如果现实信息与计划冲突，可以调整执行细节，但不要跳过任务目标。\n"
-                f"{json.dumps(plan_payload, ensure_ascii=False)}"
-            ),
-        )
-        insertion_index = next(
-            (
-                index
-                for index, message in enumerate(messages)
-                if message.role != "system"
-            ),
-            len(messages),
-        )
-        messages.insert(insertion_index, plan_message)
 
     def get_tools(self) -> list[dict[str, Any]]:
         return self.tools

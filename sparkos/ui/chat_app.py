@@ -12,10 +12,16 @@ from textual.widgets import Collapsible, Footer, Header, Input, Markdown, Static
 
 from sparkos.agent.events import (
     PlanCreated,
+    PlanReplanned,
+    StepCompleted,
+    StepFailed,
+    StepRetrying,
+    StepStarted,
+    StepToolCompleted,
+    StepVerificationCompleted,
     TaskCompleted,
     TaskFailed,
     TextDelta,
-    ToolCompleted,
 )
 from sparkos.agent.runtime import AgentRuntime
 from sparkos.agent.skills.loader import load_skills, parse_slash_command
@@ -93,7 +99,10 @@ class ChatApp(App):
 
     def __init__(self) -> None:
         super().__init__()
-        self.runtime = AgentRuntime(enable_planning=True)
+        self.runtime = AgentRuntime(
+            enable_planning=True,
+            enable_verification=True,
+        )
         self._generation_worker: object | None = None
 
     def compose(self) -> ComposeResult:
@@ -231,11 +240,29 @@ class ChatApp(App):
                         received_text = True
                         status.update("正在生成……")
                     await markdown_stream.write(event.text)
-                elif isinstance(event, ToolCompleted):
+                elif isinstance(event, StepToolCompleted):
                     await self._show_tool_call(event.tool_call, chat)
-                    status.update(f"工具: {event.tool_call.name}")
+                    status.update(f"步骤 {event.step.id} 工具: {event.tool_call.name}")
                 elif isinstance(event, PlanCreated):
                     status.update(f"已生成计划（{len(event.plan.steps)} 步）")
+                elif isinstance(event, PlanReplanned):
+                    status.update(
+                        f"已重新规划（v{event.plan.version}，"
+                        f"{len(event.plan.steps)} 步）"
+                    )
+                elif isinstance(event, StepStarted):
+                    status.update(f"正在执行: {event.step.description}")
+                elif isinstance(event, StepCompleted):
+                    status.update(f"步骤完成: {event.step.description}")
+                elif isinstance(event, StepVerificationCompleted):
+                    state = "通过" if event.verification.passed else "未通过"
+                    status.update(f"步骤验证{state}: {event.step.description}")
+                elif isinstance(event, StepRetrying):
+                    status.update(
+                        f"重试步骤（第 {event.attempt} 次）: {event.step.description}"
+                    )
+                elif isinstance(event, StepFailed):
+                    status.update(f"步骤失败: {event.step.description}")
                 elif isinstance(event, TaskCompleted):
                     status.update("生成完成")
                 elif isinstance(event, TaskFailed):
@@ -250,7 +277,7 @@ class ChatApp(App):
             traceback.print_exc()
             await markdown_stream.write(
                 f"\n\n**请求失败：** `{type(exc).__name__}`: {exc}\n\n"
-                "请检查网络、API Key 或模型配置。"
+                "请重试；如果持续失败，请查看 Task 快照或模型服务日志。"
             )
             status.update("请求失败")
             raise
