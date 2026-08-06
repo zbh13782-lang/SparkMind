@@ -7,7 +7,13 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
-from sparkos.agent.context import WINDOW, AgentContext
+from config.config import (
+    ChatConfig,
+    RuntimeConfig,
+    get_chat_config,
+    get_runtime_config,
+)
+from sparkos.agent.context import AgentContext
 from sparkos.agent.events import (
     AgentEvent,
     ClarificationRequested,
@@ -55,7 +61,7 @@ from sparkos.agent.task import AgentTask
 from sparkos.agent.task_store import TaskStore
 from sparkos.agent.tools.registry import TOOL_DEFINITIONS, execute_tool
 from sparkos.infrastructure.llm.client import OpenAIChatClient
-from sparkos.infrastructure.llm.models import ChatConfig, ChatMessage, ToolCall
+from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
 from sparkos.infrastructure.persistence.task_store import JsonTaskStore
 
 
@@ -66,7 +72,12 @@ class ModelClient(Protocol):
         tools: list[dict[str, Any]] | None = None,
     ) -> AsyncIterator[str | ToolCall]: ...
 
-    async def chat_once(self, messages: list[dict]) -> str: ...
+    async def chat_once(
+        self,
+        messages: list[dict],
+        *,
+        json_object: bool = False,
+    ) -> str: ...
 
 
 class AgentRuntime:
@@ -83,13 +94,15 @@ class AgentRuntime:
         tool_executor: ToolExecutor | None = execute_tool,
         planner: Planner | None = None,
         enable_planning: bool = False,
-        max_tool_rounds: int = 8,
+        runtime_cfg: RuntimeConfig | None = None,
         task_store: TaskStore | None = None,
         scheduler: PlanScheduler | None = None,
         step_executor: StepExecutor | None = None,
         replanner: Replanner | None = None,
-        max_replans: int = 1,
     ) -> None:
+        rt = runtime_cfg or get_runtime_config()
+        max_tool_rounds = rt.max_tool_rounds
+        max_replans = rt.max_replans
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds 不能小于 0")
         if max_replans < 0:
@@ -97,13 +110,15 @@ class AgentRuntime:
         if max_replans > 1:
             raise ValueError("每个任务最多允许 1 次重规划")
 
-        self.config = config or ChatConfig.from_yaml()
+        self.config = config or get_chat_config()
         self.context = context or AgentContext()
         self.client: ModelClient = client or OpenAIChatClient(self.config)
         self.skills = load_skills() if skills is None else skills
         self.tools = list(TOOL_DEFINITIONS) if tools is None else tools
         self.tool_executor = tool_executor
-        self.planner = planner or (LLMPlanner(self.client) if enable_planning else None)
+        self.planner = planner or (
+            LLMPlanner(self.client, max_steps=rt.max_steps) if enable_planning else None
+        )
         self.max_tool_rounds = max_tool_rounds
         self.task_store = task_store if task_store is not None else JsonTaskStore()
         self.scheduler = scheduler or PlanScheduler()
@@ -558,4 +573,4 @@ class AgentRuntime:
         return self.context.history
 
 
-__all__ = ["WINDOW", "AgentRuntime", "ModelClient", "ToolExecutor"]
+__all__ = ["AgentRuntime", "ModelClient", "ToolExecutor"]

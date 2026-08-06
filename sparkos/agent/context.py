@@ -6,14 +6,15 @@ import json
 from pathlib import Path
 from typing import Any
 
+from config.config import get_runtime_config
 from sparkos.agent import memory
 from sparkos.agent.skills.loader import Skill, build_system_message, load_skill_content
 from sparkos.infrastructure.llm.models import ChatMessage
 
 _SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
 
-# 最多可见短期窗口数
-WINDOW = 12
+# 最多可见短期窗口数，默认值来自 config.yaml runtime.context_window
+WINDOW = get_runtime_config().context_window
 
 _COMPACT_PROMPT = """你是一个对话记忆压缩器。下面是某段对话的早期内容，以及（可能存在的）之前已压缩的摘要。
 请把它们合并成一段简洁、信息完整的滚动摘要，保留：用户的目标、关键事实、已完成的操作、重要的结论或数据、未解决的问题。

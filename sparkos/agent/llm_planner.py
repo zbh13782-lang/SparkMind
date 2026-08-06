@@ -66,7 +66,12 @@ _REPLAN_PROMPT_TEMPLATE = """你是 Agent 的重规划器。当前 Plan 中的�
 
 
 class PlanningModel(Protocol):
-    async def chat_once(self, messages: list[dict]) -> str: ...
+    async def chat_once(
+        self,
+        messages: list[dict],
+        *,
+        json_object: bool = False,
+    ) -> str: ...
 
 
 class LLMPlanner(Planner):
@@ -85,7 +90,7 @@ class LLMPlanner(Planner):
     ) -> Plan | ClarificationRequest | None:
         try:
             request = self._build_request(task, context)
-            response = await self.model.chat_once(request)
+            response = await self.model.chat_once(request, json_object=True)
             payload = self._parse_payload(response)
             return self._build_initial_decision(task, payload)
         except Exception:  # noqa: BLE001
@@ -111,7 +116,7 @@ class LLMPlanner(Planner):
                 failed_step,
                 reason,
             )
-            response = await self.model.chat_once(request)
+            response = await self.model.chat_once(request, json_object=True)
             payload = self._parse_payload(response)
             return self._build_plan(
                 task,
@@ -200,24 +205,16 @@ class LLMPlanner(Planner):
     @staticmethod
     def _parse_payload(response: str) -> dict[str, Any]:
         text = response.strip()
+        # 部分模型即使要求 json_object 仍会裹一层 markdown 代码围栏。
         if text.startswith("```"):
-            lines = text.splitlines()
-            if lines and lines[-1].strip() == "```":
-                lines = lines[1:-1]
-                text = "\n".join(lines).strip()
-
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start == -1 or end <= start:
-                raise
-            payload = json.loads(text[start : end + 1])
-
-        if not isinstance(payload, dict):
-            raise TypeError("Planner 输出必须是 JSON 对象")
-        return payload
+            text = text[3:]
+            if text[:4].lower() == "json":
+                text = text[4:]
+            fence_end = text.rfind("```")
+            if fence_end != -1:
+                text = text[:fence_end]
+            text = text.strip()
+        return json.loads(text)
 
     def _build_plan(
         self,

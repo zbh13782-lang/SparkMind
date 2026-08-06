@@ -1,4 +1,4 @@
-"""通用工具定义：read_file / write_file / shell / web_fetch / spark 相关。"""
+"""通用工具定义：read_file / write_file / shell / web_fetch。"""
 
 from __future__ import annotations
 
@@ -8,8 +8,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-
-from sparkos.infrastructure.spark.client import SparkDockerClient
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -84,77 +82,6 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "submit_spark_job",
-            "description": "提交 PySpark 任务到 Spark 集群。返回 job_id 用于后续查询状态和日志。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_name": {
-                        "type": "string",
-                        "description": "任务名称，用于标识任务",
-                    },
-                    "code": {
-                        "type": "string",
-                        "description": "PySpark 代码内容",
-                    },
-                    "executor_memory": {
-                        "type": "string",
-                        "description": "Executor 内存，如 2g、4g",
-                    },
-                    "executor_cores": {
-                        "type": "integer",
-                        "description": "每个 Executor 的核数",
-                    },
-                    "num_executors": {
-                        "type": "integer",
-                        "description": "Executor 数量",
-                    },
-                    "driver_memory": {
-                        "type": "string",
-                        "description": "Driver 内存，如 2g、4g",
-                    },
-                },
-                "required": ["job_name", "code"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_spark_job_status",
-            "description": "查询 Spark 任务状态。传入 submit_spark_job 返回的 job_id。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "任务 ID（application_xxx）",
-                    }
-                },
-                "required": ["job_id"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_spark_job_logs",
-            "description": "获取 Spark 任务的日志输出。传入 job_id。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "任务 ID（application_xxx）",
-                    }
-                },
-                "required": ["job_id"],
-            },
-        },
-    },
 ]
 
 
@@ -168,45 +95,7 @@ def execute_tool(name: str, arguments: dict[str, Any]) -> str:
         return _shell(arguments["command"])
     if name == "web_fetch":
         return _web_fetch(arguments["url"])
-    if name == "submit_spark_job":
-        return _submit_spark_job(arguments)
-    if name == "get_spark_job_status":
-        return _get_spark_job_status(arguments)
-    if name == "get_spark_job_logs":
-        return _get_spark_job_logs(arguments)
     return f"未知工具: {name}"
-
-
-_SPARK_CLIENT = SparkDockerClient()
-
-
-def _submit_spark_job(arguments: dict[str, Any]) -> str:
-    result = _SPARK_CLIENT.submit(
-        job_name=arguments["job_name"],
-        code=arguments["code"],
-        job_type=arguments.get("job_type", "pyspark"),
-        executor_memory=arguments.get("executor_memory", "2g"),
-        executor_cores=int(arguments.get("executor_cores", 2)),
-        num_executors=int(arguments.get("num_executors", 2)),
-        driver_memory=arguments.get("driver_memory", "2g"),
-    )
-    return (
-        f"job_id={result.job_id}\n"
-        f"status={result.status}\n"
-        f"output:\n{result.output}"
-    )
-
-
-def _get_spark_job_status(arguments: dict[str, Any]) -> str:
-    job_id = arguments["job_id"]
-    result = _SPARK_CLIENT.get_status(job_id)
-    return f"job_id={result.job_id}\nstatus={result.status}\noutput:\n{result.output}"
-
-
-def _get_spark_job_logs(arguments: dict[str, Any]) -> str:
-    job_id = arguments["job_id"]
-    result = _SPARK_CLIENT.get_logs(job_id)
-    return f"job_id={result.job_id}\nlogs:\n{result.output}"
 
 
 def _read_file(path: str) -> str:

@@ -2,61 +2,134 @@ services:
   spark-master:
     image: apache/spark:3.5.3
     container_name: sparkos-spark-master
-    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master"]
+    hostname: spark-master
+
+    command:
+      - /opt/spark/bin/spark-class
+      - org.apache.spark.deploy.master.Master
+      - --host
+      - spark-master
+      - --port
+      - "7077"
+      - --webui-port
+      - "8080"
+
     environment:
       SPARK_NO_DAEMONIZE: "true"
+
     ports:
       - "7077:7077"
       - "8080:8080"
+
     volumes:
+      # Agent 项目代码和 Spark 作业文件
       - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
+
+      # Spark 默认配置
+      - ./docker/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+
+    networks:
+      - spark-network
+
+    restart: unless-stopped
+
 
   spark-worker:
     image: apache/spark:3.5.3
-    container_name: sparkos-spark-worker
+    hostname: spark-worker
+
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.worker.Worker
+      - --webui-port
+      - "8081"
       - spark://spark-master:7077
+
     environment:
       SPARK_NO_DAEMONIZE: "true"
       SPARK_WORKER_CORES: "2"
       SPARK_WORKER_MEMORY: "2g"
+
     depends_on:
       - spark-master
-    ports:
-      - "8081:8081"
+
+    # 不映射固定宿主机端口，避免以后扩容多个 Worker 时端口冲突
+    expose:
+      - "8081"
+
     volumes:
       - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
+      - ./docker/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+
+    networks:
+      - spark-network
+
+    restart: unless-stopped
+
 
   spark-history:
     image: apache/spark:3.5.3
     container_name: sparkos-spark-history
+    hostname: spark-history
+
     command:
       - /opt/spark/bin/spark-class
       - org.apache.spark.deploy.history.HistoryServer
+
     environment:
       SPARK_NO_DAEMONIZE: "true"
-      SPARK_HISTORY_OPTS: "-Dspark.history.fs.logDirectory=file:${SPARKOS_REPO_ROOT:-/opt/sparkos}/artifacts/spark-events"
+      SPARK_HISTORY_OPTS: >-
+        -Dspark.history.fs.logDirectory=file:/opt/sparkos/artifacts/spark-events
+        -Dspark.history.ui.port=18080
+
     depends_on:
       - spark-master
+
     ports:
       - "18080:18080"
+
     volumes:
       - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
+      - ./docker/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
 
+    networks:
+      - spark-network
+
+    restart: unless-stopped
+
+
+  # 目前 Spark 还没有配置 Hive Metastore，所以默认不启动。
+  # 需要时执行：docker compose --profile hive up -d
   hive:
     image: apache/hive:4.1.0
     container_name: sparkos-hive
+    hostname: hive
+
+    profiles:
+      - hive
+
     environment:
       SERVICE_NAME: hiveserver2
       IS_RESUME: "true"
       HIVE_SERVER2_THRIFT_PORT: "10000"
+
     ports:
       - "10000:10000"
       - "10002:10002"
+
     volumes:
       - hive-warehouse:/opt/hive/data/warehouse
+
+    networks:
+      - spark-network
+
+    restart: unless-stopped
+
+
+networks:
+  spark-network:
+    driver: bridge
+
 
 volumes:
   hive-warehouse:

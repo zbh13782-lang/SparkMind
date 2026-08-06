@@ -21,9 +21,16 @@ class FakePlanningModel:
     def __init__(self, response: str) -> None:
         self.response = response
         self.requests: list[list[dict]] = []
+        self.json_object_flags: list[bool] = []
 
-    async def chat_once(self, messages: list[dict]) -> str:
+    async def chat_once(
+        self,
+        messages: list[dict],
+        *,
+        json_object: bool = False,
+    ) -> str:
         self.requests.append(messages)
+        self.json_object_flags.append(json_object)
         return self.response
 
 

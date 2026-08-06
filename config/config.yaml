@@ -1,16 +1,18 @@
+# LLM 服务配置
 api:
   base_url: "http://localhost:20128/v1"
   api_key: "sk-54027ea1b7cab6a1-9yi909-90d259c0"
   model: "yuanshennb"
+
+# Embedding 服务配置
 Embedding_api:
   model: "wo/text-embedding-3-large"
   base_url: "http://localhost:20128"
   api_key: "sk-54027ea1b7cab6a1-9yi909-90d259c0"
-spark:
-  container: "sparkos-spark-master"
-  spark_bin: "/opt/spark/bin/spark-submit"
-  master_url: "spark://spark-master:7077"
-  default_executor_memory: "2g"
-  default_executor_cores: 2
-  default_num_executors: 2
-  default_driver_memory: "2g"
+
+# Agent Runtime参数
+runtime:
+  max_tool_rounds: 8   # 单步内工具调用最大轮数（assistant → tool → assistant 为一轮）
+  max_replans: 1       # 单任务最多重规划次数（验证失败后生成替代 Plan）
+  max_steps: 12        # 单次 Plan 最大步骤数
+  context_window: 12   # 上下文压缩阈值，超出此轮数后触发滚动摘要

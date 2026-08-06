@@ -6,7 +6,9 @@ from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
 
-from .models import ChatConfig, ChatMessage, ToolCall
+from config.config import ChatConfig
+
+from .models import ChatMessage, ToolCall
 
 
 class OpenAIChatClient:
@@ -14,13 +16,21 @@ class OpenAIChatClient:
         self.config = config
         self.client = AsyncOpenAI(base_url=config.base_url, api_key=config.api_key)
 
-    async def chat_once(self, messages: list[dict]) -> str:
+    async def chat_once(
+        self,
+        messages: list[dict],
+        *,
+        json_object: bool = False,
+    ) -> str:
         """单次非流式调用，返回完整文本。供记忆压缩等场景使用。"""
-        response = await self.client.chat.completions.create(
-            model=self.config.model,
-            messages=messages,
-            stream=False,
-        )
+        kwargs: dict = {
+            "model": self.config.model,
+            "messages": messages,
+            "stream": False,
+        }
+        if json_object:
+            kwargs["response_format"] = {"type": "json_object"}
+        response = await self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content or ""
 
     async def chat_stream(

@@ -26,7 +26,8 @@ class FakeClient:
         for item in self.turns.pop(0):
             yield item
 
-    async def chat_once(self, messages):
+    async def chat_once(self, messages, *, json_object=False):
+        del json_object
         self.compaction_requests.append(messages)
         return self.summary
 

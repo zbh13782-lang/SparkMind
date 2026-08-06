@@ -3,8 +3,9 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
+from config.config import ChatConfig
 from sparkos.infrastructure.llm.client import OpenAIChatClient
-from sparkos.infrastructure.llm.models import ChatConfig, ChatMessage, ToolCall
+from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
 
 
 class AsyncChunks:
@@ -64,7 +65,9 @@ class OpenAIChatClientTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
         )
-        client = OpenAIChatClient(ChatConfig(api_key="test"))
+        client = OpenAIChatClient(
+            ChatConfig(base_url="http://localhost/v1", api_key="test", model="test")
+        )
         client.client = SimpleNamespace(  # type: ignore[assignment]
             chat=SimpleNamespace(completions=completions)
         )
