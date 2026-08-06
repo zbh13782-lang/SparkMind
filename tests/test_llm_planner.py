@@ -12,7 +12,7 @@ from sparkos.agent.planner import (
     SkillCapability,
 )
 from sparkos.agent.scheduler import create_step_runs
-from sparkos.agent.step import StepResult, StepVerification
+from sparkos.agent.step import StepResult
 from sparkos.agent.task import AgentTask
 from sparkos.infrastructure.llm.models import ChatMessage
 
@@ -308,16 +308,9 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
         runs["s1"].start()
         runs["s1"].succeed(StepResult(True, "schema loaded"))
         runs["s2"].start()
-        runs["s2"].begin_verification(StepResult(True, "source blocked"))
-        runs["s2"].record_verification(
-            StepVerification(False, "primary source incomplete", True)
-        )
-        runs["s2"].prepare_retry()
+        runs["s2"].fail("primary source incomplete")
         runs["s2"].start()
-        runs["s2"].begin_verification(StepResult(True, "source still blocked"))
-        runs["s2"].record_verification(
-            StepVerification(False, "primary source blocked", False)
-        )
+        runs["s2"].fail("primary source blocked")
 
         revised = await LLMPlanner(model).revise_plan(
             task=task,
@@ -341,12 +334,8 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
             "schema loaded",
         )
         self.assertEqual(
-            payload["step_runs"]["s2"]["result_history"][0]["output"],
-            "source blocked",
-        )
-        self.assertEqual(
-            payload["step_runs"]["s2"]["verification_history"][0]["reason"],
-            "primary source incomplete",
+            payload["step_runs"]["s2"]["error"],
+            "primary source blocked",
         )
 
 

@@ -12,7 +12,7 @@ from sparkos.agent.planner import (
     PlanningContext,
     PlanStep,
 )
-from sparkos.agent.step import StepResult, StepRun, StepVerification
+from sparkos.agent.step import StepResult, StepRun
 from sparkos.agent.task import AgentTask
 
 _PLANNER_PROMPT_TEMPLATE = """你是 Agent 的任务规划器。你的职责仅是判断任务是否需要多步规划，并在需要时给出最小、可执行的依赖图；不要执行任务。
@@ -337,14 +337,6 @@ class LLMPlanner(Planner):
             "status": run.status.value,
             "attempt_count": run.attempt_count,
             "result": cls._serialize_result(run.result),
-            "verification": cls._serialize_verification(run.verification),
-            "result_history": [
-                cls._serialize_result(result) for result in run.result_history
-            ],
-            "verification_history": [
-                cls._serialize_verification(verification)
-                for verification in run.verification_history
-            ],
             "error": run.error,
         }
 
@@ -361,20 +353,6 @@ class LLMPlanner(Planner):
                 for artifact in result.artifacts
             ],
             "error": result.error,
-        }
-
-    @staticmethod
-    def _serialize_verification(
-        verification: StepVerification | None,
-    ) -> dict[str, Any] | None:
-        if verification is None:
-            return None
-        return {
-            "passed": verification.passed,
-            "reason": verification.reason,
-            "retryable": verification.retryable,
-            "evidence": list(verification.evidence),
-            "error": verification.error,
         }
 
     # 三色标记判定图内是否有环

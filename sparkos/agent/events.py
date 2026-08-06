@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sparkos.agent.planner import Plan, PlanStep
-from sparkos.agent.step import StepResult, StepVerification
+from sparkos.agent.step import StepResult
 from sparkos.agent.task import AgentTask
 from sparkos.infrastructure.llm.models import ToolCall
 
@@ -61,19 +61,6 @@ class StepCompleted:
 
 
 @dataclass(frozen=True)
-class StepVerificationCompleted:
-    step: PlanStep
-    verification: StepVerification
-
-
-@dataclass(frozen=True)
-class StepRetrying:
-    step: PlanStep
-    attempt: int
-    reason: str
-
-
-@dataclass(frozen=True)
 class StepFailed:
     step: PlanStep
     error: str
@@ -96,8 +83,6 @@ type AgentEvent = (
     | PlanReplanned
     | StepStarted
     | StepToolCompleted
-    | StepVerificationCompleted
-    | StepRetrying
     | StepCompleted
     | StepFailed
     | TextDelta
@@ -114,10 +99,8 @@ __all__ = [
     "PlanReplanned",
     "StepCompleted",
     "StepFailed",
-    "StepRetrying",
     "StepStarted",
     "StepToolCompleted",
-    "StepVerificationCompleted",
     "TaskCompleted",
     "TaskFailed",
     "TaskStarted",

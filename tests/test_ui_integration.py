@@ -20,7 +20,6 @@ from sparkos.agent.llm_planner import LLMPlanner
 from sparkos.agent.planner import Plan, PlanStep
 from sparkos.agent.runtime import AgentRuntime
 from sparkos.agent.task import AgentTask
-from sparkos.agent.verifier import LLMStepVerifier
 from sparkos.infrastructure.llm.models import ToolCall
 from sparkos.ui.chat_app import ChatApp
 from sparkos.ui.runtime_panel import RuntimePanel
@@ -38,12 +37,6 @@ class ChatAppIntegrationTests(unittest.TestCase):
 
         self.assertIsInstance(app.runtime.planner, LLMPlanner)
         self.assertIs(app.runtime.planner.model, app.runtime.client)
-
-    def test_chat_app_enables_llm_step_verifier(self) -> None:
-        app = ChatApp()
-
-        self.assertIsInstance(app.runtime.verifier, LLMStepVerifier)
-        self.assertIs(app.runtime.verifier.model, app.runtime.client)
 
 
 class ChatAppLayoutTests(unittest.IsolatedAsyncioTestCase):

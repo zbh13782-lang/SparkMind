@@ -5,8 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from dataclasses import replace
-from typing import Any, Protocol, cast
+from typing import Any, Protocol
 
 from sparkos.agent.context import WINDOW, AgentContext
 from sparkos.agent.events import (
@@ -16,10 +15,8 @@ from sparkos.agent.events import (
     PlanReplanned,
     StepCompleted,
     StepFailed,
-    StepRetrying,
     StepStarted,
     StepToolCompleted,
-    StepVerificationCompleted,
     TaskCompleted,
     TaskFailed,
     TaskStarted,
@@ -35,7 +32,6 @@ from sparkos.agent.planner import (
     Replanner,
     SkillCapability,
 )
-from sparkos.agent.retry import RetryPolicy
 from sparkos.agent.scheduler import (
     PlanScheduler,
     create_direct_plan,
@@ -46,7 +42,6 @@ from sparkos.agent.step import (
     StepResult,
     StepRun,
     StepStatus,
-    StepVerification,
 )
 from sparkos.agent.step_executor import (
     StepExecution,
@@ -59,7 +54,6 @@ from sparkos.agent.step_executor import (
 from sparkos.agent.task import AgentTask
 from sparkos.agent.task_store import TaskStore
 from sparkos.agent.tools.registry import TOOL_DEFINITIONS, execute_tool
-from sparkos.agent.verifier import LLMStepVerifier, StepVerifier
 from sparkos.infrastructure.llm.client import OpenAIChatClient
 from sparkos.infrastructure.llm.models import ChatConfig, ChatMessage, ToolCall
 from sparkos.infrastructure.persistence.task_store import JsonTaskStore
@@ -93,9 +87,6 @@ class AgentRuntime:
         task_store: TaskStore | None = None,
         scheduler: PlanScheduler | None = None,
         step_executor: StepExecutor | None = None,
-        verifier: StepVerifier | None = None,
-        enable_verification: bool = False,
-        retry_policy: RetryPolicy | None = None,
         replanner: Replanner | None = None,
         max_replans: int = 1,
     ) -> None:
@@ -122,14 +113,10 @@ class AgentRuntime:
             tool_executor=self.tool_executor,
             max_tool_rounds=max_tool_rounds,
         )
-        self.verifier = verifier or (
-            LLMStepVerifier(self.client) if enable_verification else None
-        )
-        self.retry_policy = retry_policy or RetryPolicy(max_attempts=2)
         if replanner is not None:
             self.replanner = replanner
         elif self.planner is not None and hasattr(self.planner, "revise_plan"):
-            self.replanner = cast(Replanner, self.planner)
+            self.replanner = self.planner
         else:
             self.replanner = None
         self.max_replans = max_replans
@@ -143,7 +130,6 @@ class AgentRuntime:
         plan: Plan | None = None
         step_runs: dict[str, StepRun] = {}
         active_run: StepRun | None = None
-        retry_feedback_by_step: dict[str, str] = {}
         replan_count = 0
 
         try:
@@ -196,8 +182,6 @@ class AgentRuntime:
                 if not ready_steps:
                     raise RuntimeError("计划无可执行步骤，请检查依赖关系")
 
-                # Phase 1 intentionally executes one ready step at a time. The
-                # scheduler API already leaves room for parallel execution later.
                 step = ready_steps[0]
                 run = step_runs[step.id]
                 run.start()
@@ -210,7 +194,6 @@ class AgentRuntime:
                     for dependency in step.depends_on
                     if step_runs[dependency].result is not None
                 }
-                retry_feedback = retry_feedback_by_step.pop(step.id, None)
                 execution: StepExecution | None = None
                 try:
                     async for update in self.step_executor.stream(
@@ -218,7 +201,6 @@ class AgentRuntime:
                         step=step,
                         dependency_results=dependency_results,
                         base_messages=base_messages,
-                        retry_feedback=retry_feedback,
                     ):
                         if isinstance(update, StepTranscriptUpdate):
                             run.record_transcript(update.transcript)
@@ -261,98 +243,37 @@ class AgentRuntime:
                     self.scheduler.block_failed_dependents(plan, step_runs)
                     self._save_task(task, plan, step_runs)
                     yield StepFailed(step=step, error=error)
-                    raise RuntimeError(error)
-
-                accepted_result = execution.result
-                if self.verifier is not None:
-                    run.begin_verification(accepted_result)
-                    self._save_task(task, plan, step_runs)
-                    try:
-                        verification = await self.verifier.verify(
+                    if self.replanner is not None and replan_count < self.max_replans:
+                        revised_plan = await self._revise_plan(
                             task=task,
-                            step=step,
-                            result=accepted_result,
-                            dependency_results=dependency_results,
+                            plan=plan,
+                            step_runs=step_runs,
+                            failed_step=step,
+                            reason=error,
                         )
-                    except Exception as exc:  # noqa: BLE001
-                        verification = StepVerification(
-                            passed=True,
-                            reason="验证器不可用，按兼容策略放行",
-                            retryable=False,
-                            error=f"{type(exc).__name__}: {exc}",
-                        )
-                    run.record_verification(verification)
-                    self._save_task(task, plan, step_runs)
-                    yield StepVerificationCompleted(
-                        step=step,
-                        verification=verification,
-                    )
-
-                    if not verification.passed:
-                        error = verification.reason
-                        if self.retry_policy.should_retry(run, verification):
-                            next_attempt = run.attempt_count + 1
-                            run.prepare_retry()
-                            active_run = None
-                            retry_feedback_by_step[step.id] = error
+                        if revised_plan is not None:
+                            previous_plan = plan
+                            step_runs = self._reconcile_step_runs(
+                                previous_plan,
+                                revised_plan,
+                                step_runs,
+                            )
+                            plan = revised_plan
+                            task.active_plan_id = plan.id
+                            replan_count += 1
                             self._save_task(task, plan, step_runs)
-                            yield StepRetrying(
-                                step=step,
-                                attempt=next_attempt,
+                            yield PlanReplanned(
+                                previous_plan=previous_plan,
+                                plan=plan,
                                 reason=error,
                             )
                             continue
+                    raise RuntimeError(error)
 
-                        run.fail(error, accepted_result)
-                        active_run = None
-                        self.scheduler.block_failed_dependents(plan, step_runs)
-                        self._save_task(task, plan, step_runs)
-                        yield StepFailed(step=step, error=error)
-                        if (
-                            self.replanner is not None
-                            and replan_count < self.max_replans
-                        ):
-                            revised_plan = await self._revise_plan(
-                                task=task,
-                                plan=plan,
-                                step_runs=step_runs,
-                                failed_step=step,
-                                reason=error,
-                            )
-                            if revised_plan is not None:
-                                previous_plan = plan
-                                step_runs = self._reconcile_step_runs(
-                                    previous_plan,
-                                    revised_plan,
-                                    step_runs,
-                                )
-                                plan = revised_plan
-                                task.active_plan_id = plan.id
-                                retry_feedback_by_step.clear()
-                                replan_count += 1
-                                self._save_task(task, plan, step_runs)
-                                yield PlanReplanned(
-                                    previous_plan=previous_plan,
-                                    plan=plan,
-                                    reason=error,
-                                )
-                                continue
-                        raise RuntimeError(error)
-
-                    evidence = tuple(
-                        dict.fromkeys(
-                            (*accepted_result.evidence, *verification.evidence)
-                        )
-                    )
-                    accepted_result = replace(
-                        accepted_result,
-                        evidence=evidence,
-                    )
-
-                run.succeed(accepted_result)
+                run.succeed(execution.result)
                 active_run = None
                 self._save_task(task, plan, step_runs)
-                yield StepCompleted(step=step, result=accepted_result)
+                yield StepCompleted(step=step, result=execution.result)
 
             if plan.source == "direct":
                 final_answer = step_runs[plan.steps[0].id].result
@@ -414,20 +335,14 @@ class AgentRuntime:
 
         except GeneratorExit:
             task.cancel()
-            if active_run is not None and active_run.status in {
-                StepStatus.RUNNING,
-                StepStatus.VERIFYING,
-            }:
+            if active_run is not None and active_run.status == StepStatus.RUNNING:
                 active_run.cancel()
             self.context.persist()
             self._save_task_best_effort(task, plan, step_runs)
             return
         except asyncio.CancelledError:
             task.cancel()
-            if active_run is not None and active_run.status in {
-                StepStatus.RUNNING,
-                StepStatus.VERIFYING,
-            }:
+            if active_run is not None and active_run.status == StepStatus.RUNNING:
                 active_run.cancel()
             self.context.persist()
             self._save_task_best_effort(task, plan, step_runs)
@@ -500,7 +415,7 @@ class AgentRuntime:
     @staticmethod
     def _is_textual_tool_call(text: str) -> bool:
         normalized = text.lstrip().casefold()
-        return normalized.startswith("<tool_call")
+        return normalized.startswith("<tool_call") and ">" in normalized
 
     @staticmethod
     def _insert_system_message(
@@ -592,8 +507,6 @@ class AgentRuntime:
         try:
             self._save_task(task, plan, step_runs)
         except Exception:  # noqa: BLE001
-            # Preserve the original execution/cancellation exception. A failed
-            # primary snapshot save has already made the task fail.
             return
 
     async def _compact_if_needed(self) -> bool:

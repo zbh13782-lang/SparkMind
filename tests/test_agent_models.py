@@ -5,13 +5,11 @@ from dataclasses import FrozenInstanceError
 
 from sparkos.agent.events import TaskCompleted, TextDelta, ToolCompleted
 from sparkos.agent.planner import Plan, PlanStep
-from sparkos.agent.retry import RetryPolicy
 from sparkos.agent.step import (
     ArtifactRef,
     StepResult,
     StepRun,
     StepStatus,
-    StepVerification,
 )
 from sparkos.agent.task import AgentTask, TaskStatus
 from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
@@ -168,41 +166,6 @@ class StepRunTests(unittest.TestCase):
 
         self.assertEqual(run.status, StepStatus.CANCELLED)
         self.assertEqual(run.transcript[-1]["tool_call_id"], "c1")
-
-    def test_step_verification_rejection_can_prepare_one_retry(self) -> None:
-        run = StepRun(step_id="s1")
-        candidate = StepResult(success=True, output="weather unavailable")
-        verification = StepVerification(
-            passed=False,
-            reason="missing temperature",
-            retryable=True,
-        )
-        run.start()
-        run.record_transcript([{"role": "assistant", "content": candidate.output}])
-
-        run.begin_verification(candidate)
-        run.record_verification(verification)
-
-        self.assertEqual(run.status, StepStatus.VERIFYING)
-        self.assertTrue(RetryPolicy(max_attempts=2).should_retry(run, verification))
-
-        run.prepare_retry()
-
-        self.assertEqual(run.status, StepStatus.PENDING)
-        self.assertIsNone(run.result)
-        self.assertEqual(run.result_history, [candidate])
-        self.assertEqual(len(run.transcript_history), 1)
-        self.assertEqual(run.verification_history, [verification])
-
-    def test_retry_policy_stops_at_attempt_limit(self) -> None:
-        run = StepRun(step_id="s1", attempt_count=2)
-        verification = StepVerification(False, "still incomplete", True)
-
-        self.assertFalse(RetryPolicy(max_attempts=2).should_retry(run, verification))
-
-    def test_retry_policy_rejects_more_than_two_attempts(self) -> None:
-        with self.assertRaisesRegex(ValueError, "最多允许 2 次"):
-            RetryPolicy(max_attempts=3)
 
 
 class EventModelTests(unittest.TestCase):

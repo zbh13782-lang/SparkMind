@@ -77,7 +77,6 @@ class StepExecutor:
         step: PlanStep,
         dependency_results: dict[str, StepResult],
         base_messages: list[ChatMessage],
-        retry_feedback: str | None = None,
     ) -> StepExecution:
         execution: StepExecution | None = None
         async for update in self.stream(
@@ -85,7 +84,6 @@ class StepExecutor:
             step=step,
             dependency_results=dependency_results,
             base_messages=base_messages,
-            retry_feedback=retry_feedback,
         ):
             if isinstance(update, StepExecution):
                 execution = update
@@ -99,7 +97,6 @@ class StepExecutor:
         step: PlanStep,
         dependency_results: dict[str, StepResult],
         base_messages: list[ChatMessage],
-        retry_feedback: str | None = None,
     ) -> AsyncIterator[StepTranscriptUpdate | StepToolExecution | StepExecution]:
         messages = list(base_messages)
         self._inject_step_context(
@@ -107,7 +104,6 @@ class StepExecutor:
             task,
             step,
             dependency_results,
-            retry_feedback,
         )
         transcript: list[dict[str, Any]] = []
         executed_calls: list[ToolCall] = []
@@ -251,7 +247,6 @@ class StepExecutor:
         task: AgentTask,
         step: PlanStep,
         dependency_results: dict[str, StepResult],
-        retry_feedback: str | None = None,
     ) -> None:
         payload = {
             "task_goal": task.goal,
@@ -265,7 +260,6 @@ class StepExecutor:
                 step_id: StepExecutor._serialize_result(result)
                 for step_id, result in dependency_results.items()
             },
-            "retry_feedback": retry_feedback,
         }
         step_message = ChatMessage(
             role="system",

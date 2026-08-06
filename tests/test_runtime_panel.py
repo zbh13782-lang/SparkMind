@@ -10,17 +10,15 @@ from sparkos.agent.events import (
     PlanReplanned,
     StepCompleted,
     StepFailed,
-    StepRetrying,
     StepStarted,
     StepToolCompleted,
-    StepVerificationCompleted,
     TaskCompleted,
     TaskFailed,
     TaskStarted,
     TextDelta,
 )
 from sparkos.agent.planner import Plan, PlanStep
-from sparkos.agent.step import StepResult, StepVerification
+from sparkos.agent.step import StepResult
 from sparkos.agent.task import AgentTask
 from sparkos.infrastructure.llm.models import ToolCall
 from sparkos.ui.runtime_panel import RuntimeTrace
@@ -67,7 +65,7 @@ class RuntimeTraceTests(unittest.TestCase):
         self.assertIn("等待补充", trace.render_text().plain)
         self.assertIn("Which file?", trace.render_text().plain)
 
-    def test_tracks_task_plan_tool_verification_and_response(self) -> None:
+    def test_tracks_task_plan_tool_and_response(self) -> None:
         task = sample_task()
         plan = sample_plan()
         load = plan.steps[0]
@@ -96,14 +94,6 @@ class RuntimeTraceTests(unittest.TestCase):
         self.assertEqual(trace.phase, "tooling")
         self.assertEqual(trace.steps["load"].tool_count, 1)
 
-        trace.apply(
-            StepVerificationCompleted(
-                load,
-                StepVerification(True, "source loaded", False),
-            )
-        )
-        self.assertEqual(trace.phase, "verifying")
-
         trace.apply(StepCompleted(load, StepResult(True, "loaded")))
         self.assertEqual(trace.steps["load"].status, "succeeded")
 
@@ -121,7 +111,7 @@ class RuntimeTraceTests(unittest.TestCase):
         plain_lines = rendered.plain.splitlines()
         self.assertLessEqual(max(cell_len(line) for line in plain_lines), 34)
 
-    def test_tracks_retry_replan_and_failure(self) -> None:
+    def test_tracks_replan_and_failure(self) -> None:
         task = sample_task()
         original = sample_plan()
         load = original.steps[0]
@@ -143,23 +133,12 @@ class RuntimeTraceTests(unittest.TestCase):
         trace.apply(TaskStarted(task))
         trace.apply(PlanCreated(original))
         trace.apply(StepStarted(load))
-        trace.apply(
-            StepVerificationCompleted(
-                load,
-                StepVerification(False, "incomplete", True),
-            )
-        )
-        trace.apply(StepRetrying(load, attempt=2, reason="incomplete"))
+        trace.apply(StepFailed(load, "source changed"))
 
-        self.assertEqual(trace.steps["load"].status, "retrying")
-        self.assertEqual(trace.steps["load"].attempt, 2)
-
-        trace.apply(StepStarted(load))
-        trace.apply(StepCompleted(load, StepResult(True, "loaded")))
         trace.apply(PlanReplanned(original, revised, "source changed"))
 
         self.assertEqual(trace.plan_version, 2)
-        self.assertEqual(trace.steps["load"].status, "succeeded")
+        self.assertEqual(trace.steps["load"].status, "pending")
         self.assertEqual(trace.steps["fallback"].status, "pending")
 
         trace.apply(StepStarted(fallback))

@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 
 from sparkos.agent.planner import Plan, PlanStep
 from sparkos.agent.scheduler import create_step_runs
-from sparkos.agent.step import ArtifactRef, StepResult, StepVerification
+from sparkos.agent.step import ArtifactRef, StepResult
 from sparkos.agent.task import AgentTask
 from sparkos.agent.task_store import TaskStore
 from sparkos.infrastructure.persistence.task_store import JsonTaskStore
@@ -92,8 +92,8 @@ class JsonTaskStoreTests(unittest.TestCase):
             )
             self.assertEqual(list(root.glob("*.tmp")), [])
 
-    def test_json_store_writes_verification_and_attempt_history(self) -> None:
-        task = AgentTask(id="task-verify", goal="analyze")
+    def test_json_store_writes_attempt_history(self) -> None:
+        task = AgentTask(id="task-retry", goal="analyze")
         plan = Plan(
             task_id=task.id,
             steps=(PlanStep(id="s1", description="analyze"),),
@@ -101,12 +101,12 @@ class JsonTaskStoreTests(unittest.TestCase):
         runs = create_step_runs(plan)
         run = runs["s1"]
         first = StepResult(success=True, output="incomplete")
-        rejection = StepVerification(False, "missing totals", True)
         run.start()
         run.record_transcript([{"role": "assistant", "content": "incomplete"}])
-        run.begin_verification(first)
-        run.record_verification(rejection)
-        run.prepare_retry()
+        run.fail("missing totals", first)
+        run.start()
+        run.record_transcript([{"role": "assistant", "content": "complete"}])
+        run.succeed(StepResult(success=True, output="complete"))
 
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -114,14 +114,11 @@ class JsonTaskStoreTests(unittest.TestCase):
             payload = json.loads((root / f"{task.id}.json").read_text(encoding="utf-8"))
 
         stored = payload["step_runs"]["s1"]
-        self.assertEqual(stored["result_history"][0]["output"], "incomplete")
+        self.assertEqual(stored["attempt_count"], 2)
+        self.assertEqual(stored["result"]["output"], "complete")
         self.assertEqual(
-            stored["verification_history"][0]["reason"],
-            "missing totals",
-        )
-        self.assertEqual(
-            stored["transcript_history"][0][0]["content"],
-            "incomplete",
+            stored["transcript"][0]["content"],
+            "complete",
         )
 
     def test_json_store_atomically_replaces_existing_snapshot(self) -> None:

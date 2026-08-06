@@ -14,7 +14,6 @@ from sparkos.agent.step import (
     ArtifactRef,
     StepResult,
     StepRun,
-    StepVerification,
 )
 from sparkos.agent.task import AgentTask
 
@@ -113,30 +112,6 @@ class JsonTaskStore:
             "result": cls._serialize_result(run.result) if run.result else None,
             "error": run.error,
             "transcript": run.transcript,
-            "verification": (
-                cls._serialize_verification(run.verification)
-                if run.verification
-                else None
-            ),
-            "verification_history": [
-                cls._serialize_verification(item) for item in run.verification_history
-            ],
-            "result_history": [
-                cls._serialize_result(item) for item in run.result_history
-            ],
-            "transcript_history": run.transcript_history,
-        }
-
-    @staticmethod
-    def _serialize_verification(
-        verification: StepVerification,
-    ) -> dict[str, Any]:
-        return {
-            "passed": verification.passed,
-            "reason": verification.reason,
-            "retryable": verification.retryable,
-            "evidence": list(verification.evidence),
-            "error": verification.error,
         }
 
     @classmethod

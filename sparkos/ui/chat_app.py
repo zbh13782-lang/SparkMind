@@ -19,10 +19,8 @@ from sparkos.agent.events import (
     PlanReplanned,
     StepCompleted,
     StepFailed,
-    StepRetrying,
     StepStarted,
     StepToolCompleted,
-    StepVerificationCompleted,
     TaskCompleted,
     TaskFailed,
     TextDelta,
@@ -164,7 +162,6 @@ class ChatApp(App):
         super().__init__()
         self.runtime = AgentRuntime(
             enable_planning=True,
-            enable_verification=True,
         )
         self._generation_worker: object | None = None
 
@@ -353,13 +350,6 @@ class ChatApp(App):
                     status.update(f"正在执行: {event.step.description}")
                 elif isinstance(event, StepCompleted):
                     status.update(f"步骤完成: {event.step.description}")
-                elif isinstance(event, StepVerificationCompleted):
-                    state = "通过" if event.verification.passed else "未通过"
-                    status.update(f"步骤验证{state}: {event.step.description}")
-                elif isinstance(event, StepRetrying):
-                    status.update(
-                        f"重试步骤（第 {event.attempt} 次）: {event.step.description}"
-                    )
                 elif isinstance(event, StepFailed):
                     status.update(f"步骤失败: {event.step.description}")
                 elif isinstance(event, TaskCompleted):

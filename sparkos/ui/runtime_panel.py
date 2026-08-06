@@ -16,10 +16,8 @@ from sparkos.agent.events import (
     PlanReplanned,
     StepCompleted,
     StepFailed,
-    StepRetrying,
     StepStarted,
     StepToolCompleted,
-    StepVerificationCompleted,
     TaskCompleted,
     TaskFailed,
     TaskStarted,
@@ -34,7 +32,6 @@ _PHASES = (
     ("planning", "规划"),
     ("executing", "执行"),
     ("tooling", "工具"),
-    ("verifying", "验证"),
     ("responding", "回答"),
 )
 
@@ -64,8 +61,6 @@ _STEP_MARKS = {
     "pending": ("○", "dim"),
     "running": ("▶", "cyan"),
     "tooling": ("◆", "magenta"),
-    "verifying": ("◇", "yellow"),
-    "retrying": ("↻", "yellow"),
     "succeeded": ("✓", "green"),
     "failed": ("×", "red"),
     "cancelled": ("■", "yellow"),
@@ -172,18 +167,6 @@ class RuntimeTrace:
             self.total_tokens += count_messages(
                 [ChatMessage(role="tool", content=event.tool_call.result)]
             )
-        elif isinstance(event, StepVerificationCompleted):
-            step = self._ensure_step(event.step)
-            step.status = "verifying"
-            self._set_phase("verifying")
-            state = "验证通过" if event.verification.passed else "验证未通过"
-            self._record(f"{step.id} · {state}")
-        elif isinstance(event, StepRetrying):
-            step = self._ensure_step(event.step)
-            step.status = "retrying"
-            step.attempt = event.attempt
-            self._set_phase("executing")
-            self._record(f"{step.id} · 准备第 {event.attempt} 次尝试")
         elif isinstance(event, StepCompleted):
             step = self._ensure_step(event.step)
             step.status = "succeeded"
@@ -219,7 +202,7 @@ class RuntimeTrace:
     def cancel(self) -> None:
         if self.task_status in {"idle", "succeeded", "failed", "cancelled"}:
             return
-        transient_statuses = {"running", "tooling", "verifying", "retrying"}
+        transient_statuses = {"running", "tooling"}
         for step in self.steps.values():
             if step.status in transient_statuses:
                 step.status = "cancelled"
