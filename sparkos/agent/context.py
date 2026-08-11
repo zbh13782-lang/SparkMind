@@ -165,7 +165,7 @@ class AgentContext:
         if not summary.strip() or message_count <= 0:
             return
         self.summary = summary.strip()
-        self.summary_upto += message_count
+        self.summary_upto = min(self.summary_upto + message_count, len(self.history))
 
     def ensure_session(self) -> None:
         if self.session_id is None:

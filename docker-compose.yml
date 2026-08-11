@@ -16,22 +16,31 @@ services:
 
     environment:
       SPARK_NO_DAEMONIZE: "true"
+      SPARK_EVENTLOG_ENABLED: "true"
+      SPARK_EVENTLOG_DIR: "file:/opt/sparkos/artifacts/spark-events"
+      SPARK_HISTORY_FS_LOG_DIRECTORY: "file:/opt/sparkos/artifacts/spark-events"
+      SPARK_SQL_SESSION_TIMEZONE: "Asia/Shanghai"
+      SPARK_SQL_SHUFFLE_PARTITIONS: "4"
+      SPARK_UI_SHOWCONSOLE_PROGRESS: "false"
 
     ports:
       - "7077:7077"
       - "8080:8080"
 
     volumes:
-      # Agent 项目代码和 Spark 作业文件
       - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
-
-      # Spark 默认配置
-      - ./docker/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
 
     networks:
       - spark-network
 
     restart: unless-stopped
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+      start_period: 5s
 
 
   spark-worker:
@@ -49,22 +58,45 @@ services:
       SPARK_NO_DAEMONIZE: "true"
       SPARK_WORKER_CORES: "2"
       SPARK_WORKER_MEMORY: "2g"
+      SPARK_EVENTLOG_ENABLED: "true"
+      SPARK_EVENTLOG_DIR: "file:/opt/sparkos/artifacts/spark-events"
+      SPARK_HISTORY_FS_LOG_DIRECTORY: "file:/opt/sparkos/artifacts/spark-events"
+      SPARK_SQL_SESSION_TIMEZONE: "Asia/Shanghai"
+      SPARK_SQL_SHUFFLE_PARTITIONS: "4"
+      SPARK_UI_SHOWCONSOLE_PROGRESS: "false"
 
     depends_on:
-      - spark-master
+      spark-master:
+        condition: service_healthy
 
-    # 不映射固定宿主机端口，避免以后扩容多个 Worker 时端口冲突
     expose:
       - "8081"
 
     volumes:
       - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
-      - ./docker/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
 
     networks:
       - spark-network
 
     restart: unless-stopped
+
+
+  spark-client:
+    image: apache/spark:3.5.3
+    profiles:
+      - jobs
+
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      spark-worker:
+        condition: service_started
+
+    volumes:
+      - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
+
+    networks:
+      - spark-network
 
 
   spark-history:
@@ -90,7 +122,6 @@ services:
 
     volumes:
       - ${SPARKOS_REPO_ROOT:-.}:/opt/sparkos
-      - ./docker/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
 
     networks:
       - spark-network
@@ -98,8 +129,6 @@ services:
     restart: unless-stopped
 
 
-  # 目前 Spark 还没有配置 Hive Metastore，所以默认不启动。
-  # 需要时执行：docker compose --profile hive up -d
   hive:
     image: apache/hive:4.1.0
     container_name: sparkos-hive

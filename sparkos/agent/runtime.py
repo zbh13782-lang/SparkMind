@@ -237,7 +237,6 @@ class AgentRuntime:
                         run.record_transcript(exc.transcript)
                     run.fail(error)
                     active_run = None
-                    self._save_task(task, plan, step_runs)
                     yield StepFailed(step=step, error=error)
                     raise
 
@@ -245,7 +244,6 @@ class AgentRuntime:
                     error = "步骤执行未返回结果"
                     run.fail(error)
                     active_run = None
-                    self._save_task(task, plan, step_runs)
                     yield StepFailed(step=step, error=error)
                     raise RuntimeError(error)
 
@@ -421,6 +419,7 @@ class AgentRuntime:
             result = step_runs[step.id].result
             if (
                 result is not None
+                and result.success
                 and result.output
                 and not cls._is_textual_tool_call(result.output)
             ):
@@ -430,7 +429,7 @@ class AgentRuntime:
     @staticmethod
     def _is_textual_tool_call(text: str) -> bool:
         normalized = text.lstrip().casefold()
-        return normalized.startswith("<tool_call") and ">" in normalized
+        return normalized.startswith("<tool_call")
 
     @staticmethod
     def _insert_system_message(

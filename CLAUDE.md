@@ -102,8 +102,8 @@ docker compose up -d
 - 澄清分支：Planner 返回 `ClarificationRequest` → Task 转 `WAITING_INPUT` → 发 `ClarificationRequested` 事件后**直接 return**，不执行任何步骤
 - Runtime 事件流被取消或提前关闭（`GeneratorExit` / `CancelledError`）时，活跃 Task/Step 转 `CANCELLED` 并尽力保存快照
 - Tool calling 的规范消息链由 StepExecutor 局部维护：assistant(tool_calls) → tool(tool_call_id) → assistant
-- **`<tool_call>` 文本泄漏防御**：部分模型会把工具调用当普通文本吐出来。`_is_textual_tool_call` 检测，
-  `_fallback_answer` 倒序找最后一个有效步骤输出兜底；汇总阶段还会缓冲开头的 delta，
+- **`<tool_call>` 文本泄漏防御**：部分模型会把工具调用当普通文本吐出来。`_is_textual_tool_call` 只检查 `startswith("<tool_call")`，
+  `_fallback_answer` 倒序找最后一个成功步骤输出兜底；汇总阶段还会缓冲开头的 delta，
   确认不是 `<tool_call` 前缀才开始真正 yield
 - 上下文压缩：`needs_compact()` 是 `len(history) - summary_upto > WINDOW`（WINDOW 来自 config，非硬编码），
   但真正的闸门是 `messages_to_compact()`——**它把截断点前推到 `user` 角色边界，找不到就返回 `[]`**，
@@ -128,13 +128,17 @@ docker compose up -d
 - 对话历史存 `~/.sparkmind/history/`；Task 执行快照存项目内 `.sparkmind/tasks/{task_id}.json`
 - 需要 Python ≥ 3.14（`memory.py` 用了 PEP 758 的无括号多异常 `except` 语法）
 
-## Spark 本地集成（进行中，见 docs/superpowers/plans/2026-08-06-local-docker-spark-integration.md）
+## Spark 本地集成（已实现，见 docs/superpowers/plans/2026-08-06-local-docker-spark-integration.md）
 
-- docker-compose 四个服务：`spark-master`(7077/8080)、`spark-worker`(仅 expose 8081，故意不映射宿主端口以便扩容)、
-  `spark-history`(18080)、`hive`(10000/10002，`profiles: [hive]` 默认不启)
-- 通过 `spark://spark-master:7077` 提交；容器内可直接
-  `docker exec sparkos-spark-master /opt/spark/bin/spark-submit ...`
-- `agent/skills/spark-job` 和 `spark-sql` 负责生成提交命令、查询状态、解析日志；作业产物约定落在 `artifacts/`
+- docker-compose 服务：`spark-master`(7077/8080, healthcheck: `curl -sf http://localhost:8080`)、
+  `spark-worker`(仅 expose 8081，故意不映射宿主端口以便扩容)、
+  `spark-history`(18080)、`spark-client`(profile: jobs, `docker compose run --rm` 一次性容器)、
+  `hive`(10000/10002，`profiles: [hive]` 默认不启)
+- Spark 配置通过环境变量注入（`SPARK_EVENTLOG_ENABLED` 等），**不用文件级 bind mount**（Docker for Mac 不支持）
+- `run_spark_job` 工具：Agent 调用一次，背后自动完成 创建 job 目录 → 写脚本 → 启动一次性容器 → 提交到集群 → 等待完成 → 清理容器 → 返回 JSON
+- 基础设施层独立于 agent：`sparkos/infrastructure/spark/` 包含 `models.py`(请求验证) + `client.py`(runner) + `__init__.py`
+- SKILL.md 已改为同步单次调用模型，不再有轮询/状态查询
+- 踩坑记录：`docs/mistakes.md`，如果遇到什么bug，可以看这个
 
 ## work principle
 

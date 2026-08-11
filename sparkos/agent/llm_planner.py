@@ -214,7 +214,10 @@ class LLMPlanner(Planner):
             if fence_end != -1:
                 text = text[:fence_end]
             text = text.strip()
-        return json.loads(text)
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise TypeError(f"Planner 返回了非对象 JSON: {type(payload).__name__}")
+        return payload
 
     def _build_plan(
         self,
