@@ -494,8 +494,7 @@ Use this exact schema:
     "function": {
         "name": "run_code",
         "description": (
-            "在无网络、无宿主工作区访问的一次性 Docker 沙箱中运行 Python 或 Bash，"
-            "返回退出码、限长输出和完整日志路径。"
+            "在无网络、无宿主工作区访问的一次性 Docker 沙箱中运行 Python 或 Bash，返回退出码、限长输出和完整日志路径。"
         ),
         "parameters": {
             "type": "object",
@@ -760,6 +759,7 @@ def test_registry_exposes_advisor_contract(self) -> None:
         ["question", "context", "attempts"],
     )
 
+
 async def test_advisor_dispatch_returns_json(self) -> None:
     expected = AdvisorResult(
         status="succeeded",
@@ -832,7 +832,7 @@ Dispatch through an async `_ask_advisor(arguments)` helper that constructs `Advi
 Extend `StepExecutor.__init__` with:
 
 ```python
-tool_call_limits: dict[str, int] | None = None,
+tool_call_limits: dict[str, int] | None = (None,)
 ```
 
 Copy and validate the mapping: names must be non-empty strings and limits must be positive integers. At the start of `stream`, create `tool_call_counts: dict[str, int] = {}`. Before `_execute_tool_call`, return `工具调用次数超过单步限制（ask_advisor: 1）` without dispatch when the count has reached its limit; otherwise increment the count and dispatch. Count calls even when the advisor returns a failed result, because the expensive model request was attempted.
@@ -847,7 +847,7 @@ runtime:
 In `AgentRuntime`, pass:
 
 ```python
-tool_call_limits={"ask_advisor": rt.max_advisor_calls_per_step},
+tool_call_limits = ({"ask_advisor": rt.max_advisor_calls_per_step},)
 ```
 
 when constructing the default `StepExecutor`. A caller-supplied `step_executor` remains untouched.

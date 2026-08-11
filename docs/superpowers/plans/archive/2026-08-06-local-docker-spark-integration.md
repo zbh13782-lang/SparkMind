@@ -336,9 +336,7 @@ class SparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             repo_root = Path(directory)
             compose_file = repo_root / "docker-compose.yml"
             compose_file.write_text("services: {}", encoding="utf-8")
-            runner = SparkJobRunner(
-                SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file)
-            )
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
             process = FakeProcess()
 
             with patch(
@@ -354,21 +352,14 @@ class SparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             command = create_process.await_args.args
-            self.assertEqual(
-                command[:4], ("docker", "compose", "-f", str(compose_file))
-            )
+            self.assertEqual(command[:4], ("docker", "compose", "-f", str(compose_file)))
             self.assertIn("run", command)
             self.assertIn("--rm", command)
             self.assertIn("-T", command)
             self.assertIn("spark-client", command)
             self.assertIn("spark://spark-master:7077", command)
             self.assertIn("spark.driver.bindAddress=0.0.0.0", command)
-            self.assertTrue(
-                any(
-                    argument.startswith("spark.driver.host=sparkmind-job-")
-                    for argument in command
-                )
-            )
+            self.assertTrue(any(argument.startswith("spark.driver.host=sparkmind-job-") for argument in command))
             self.assertNotIn("sh", command)
             self.assertNotIn("-c", command)
             self.assertEqual(result.status, "succeeded")
@@ -378,9 +369,7 @@ class SparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             repo_root = Path(directory)
             compose_file = repo_root / "docker-compose.yml"
             compose_file.write_text("services: {}", encoding="utf-8")
-            runner = SparkJobRunner(
-                SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file)
-            )
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
 
             with patch(
                 "sparkos.infrastructure.spark.client.asyncio.create_subprocess_exec",
@@ -407,9 +396,7 @@ class SparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             repo_root = Path(directory)
             compose_file = repo_root / "docker-compose.yml"
             compose_file.write_text("services: {}", encoding="utf-8")
-            runner = SparkJobRunner(
-                SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file)
-            )
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
 
             async def launch(*args: object, **kwargs: object) -> FakeProcess:
                 log_file = kwargs["stdout"]
@@ -454,9 +441,7 @@ class SparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             repo_root = Path(directory)
             compose_file = repo_root / "docker-compose.yml"
             compose_file.write_text("services: {}", encoding="utf-8")
-            runner = SparkJobRunner(
-                SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file)
-            )
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
             processes = [HangingProcess(), FakeProcess(), FakeProcess()]
 
             with patch(
@@ -472,18 +457,9 @@ class SparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
 
-            cleanup_commands = [
-                call.args for call in create_process.await_args_list[1:]
-            ]
-            self.assertTrue(
-                any(command[:2] == ("docker", "stop") for command in cleanup_commands)
-            )
-            self.assertTrue(
-                any(
-                    command[:3] == ("docker", "rm", "-f")
-                    for command in cleanup_commands
-                )
-            )
+            cleanup_commands = [call.args for call in create_process.await_args_list[1:]]
+            self.assertTrue(any(command[:2] == ("docker", "stop") for command in cleanup_commands))
+            self.assertTrue(any(command[:3] == ("docker", "rm", "-f") for command in cleanup_commands))
             self.assertEqual(result.status, "timed_out")
 ```
 
@@ -791,11 +767,7 @@ from sparkos.infrastructure.spark.models import SparkJobResult
 
 class SparkToolTests(unittest.IsolatedAsyncioTestCase):
     def test_registry_exposes_one_spark_tool(self) -> None:
-        spark_tools = [
-            tool["function"]
-            for tool in TOOL_DEFINITIONS
-            if "spark" in tool["function"]["name"]
-        ]
+        spark_tools = [tool["function"] for tool in TOOL_DEFINITIONS if "spark" in tool["function"]["name"]]
 
         self.assertEqual([tool["name"] for tool in spark_tools], ["run_spark_job"])
         self.assertEqual(

@@ -84,9 +84,7 @@ class StepExecutorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(execution.result.success)
         self.assertEqual(execution.result.output, "analysis done")
-        system_messages = [
-            message for message in client.requests[0] if message["role"] == "system"
-        ]
+        system_messages = [message for message in client.requests[0] if message["role"] == "system"]
         payload = json.loads(system_messages[-1]["content"].split("\n", 1)[1])
         self.assertEqual(payload["task_input"], {"dataset": "sales.csv"})
         self.assertEqual(payload["current_step"]["id"], "s2")
@@ -173,9 +171,7 @@ class StepExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(execution.result.success)
         self.assertEqual(execution.result.output, "上海今天晴，33°C。")
         self.assertEqual(len(client.requests), 3)
-        self.assertTrue(
-            any("已有工具结果" in message["content"] for message in client.requests[2])
-        )
+        self.assertTrue(any("已有工具结果" in message["content"] for message in client.requests[2]))
 
     async def test_executor_rejects_empty_step_output(self) -> None:
         executor = StepExecutor(
@@ -195,8 +191,8 @@ class StepExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(execution.result.error, "步骤未产出结果")
 
     async def test_executor_limits_tool_rounds(self) -> None:
-        first = ToolCall(call_id="c1", name="shell", arguments="{}")
-        second = ToolCall(call_id="c2", name="shell", arguments="{}")
+        first = ToolCall(call_id="c1", name="read_file", arguments="{}")
+        second = ToolCall(call_id="c2", name="read_file", arguments="{}")
         executor = StepExecutor(
             client=FakeStepClient(turns=[[first], [second]]),
             tools=[],
@@ -211,6 +207,66 @@ class StepExecutorTests(unittest.IsolatedAsyncioTestCase):
                 dependency_results={},
                 base_messages=base_messages(),
             )
+
+    async def test_advisor_call_limit_enforced_within_step(self) -> None:
+        advisor_call_1 = ToolCall(
+            call_id="a1",
+            name="ask_advisor",
+            arguments='{"question":"q1","context":"c","attempts":"a"}',
+        )
+        advisor_call_2 = ToolCall(
+            call_id="a2",
+            name="ask_advisor",
+            arguments='{"question":"q2","context":"c","attempts":"b"}',
+        )
+        final_text = "Decided without second advisor."
+        # Both advisor calls in same model turn; second should be budget-blocked
+        client = FakeStepClient(turns=[[advisor_call_1, advisor_call_2], [final_text]])
+        executor = StepExecutor(
+            client=client,
+            tools=[],
+            tool_executor=lambda *_: "advisor response",
+            tool_call_limits={"ask_advisor": 1},
+        )
+
+        execution = await executor.execute(
+            task=AgentTask(goal="decide"),
+            step=sample_step(),
+            dependency_results={},
+            base_messages=base_messages(),
+        )
+
+        self.assertTrue(execution.result.success)
+        self.assertEqual(execution.result.output, final_text)
+        # First advisor call dispatched, second blocked — only 1 in executed_calls
+        self.assertEqual(len(execution.tool_calls), 1)
+        self.assertEqual(execution.tool_calls[0].result, "advisor response")
+        # The budget-blocked message was sent to the model as a tool result
+        tool_messages = [m for m in execution.transcript if m["role"] == "tool"]
+        self.assertTrue(any("超过单步限制" in m["content"] for m in tool_messages))
+
+    async def test_unlimited_tool_dispatches_normally(self) -> None:
+        first = ToolCall(call_id="c1", name="read_file", arguments='{"path":"x"}')
+        second = ToolCall(call_id="c2", name="read_file", arguments='{"path":"y"}')
+        final_text = "result"
+        client = FakeStepClient(turns=[[first], [second], [final_text]])
+        executor = StepExecutor(
+            client=client,
+            tools=[],
+            tool_executor=lambda *_: "content",
+            max_tool_rounds=2,
+        )
+
+        execution = await executor.execute(
+            task=AgentTask(goal="read"),
+            step=sample_step(),
+            dependency_results={},
+            base_messages=base_messages(),
+        )
+
+        self.assertTrue(execution.result.success)
+        self.assertEqual(execution.result.output, final_text)
+        self.assertEqual(len(execution.tool_calls), 2)
 
 
 if __name__ == "__main__":

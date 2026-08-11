@@ -65,19 +65,12 @@ class OpenAIChatClientTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ]
         )
-        client = OpenAIChatClient(
-            ChatConfig(base_url="http://localhost/v1", api_key="test", model="test")
-        )
+        client = OpenAIChatClient(ChatConfig(base_url="http://localhost/v1", api_key="test", model="test"))
         client.client = SimpleNamespace(  # type: ignore[assignment]
             chat=SimpleNamespace(completions=completions)
         )
 
-        items = [
-            item
-            async for item in client.chat_stream(
-                [ChatMessage(role="user", content="read")]
-            )
-        ]
+        items = [item async for item in client.chat_stream([ChatMessage(role="user", content="read")])]
 
         self.assertEqual(len(items), 1)
         self.assertIsInstance(items[0], ToolCall)

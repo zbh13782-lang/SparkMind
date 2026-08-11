@@ -38,10 +38,7 @@ class PlanScheduler:
             step
             for step in plan.steps
             if step_runs[step.id].status == StepStatus.PENDING
-            and all(
-                step_runs[dependency].status == StepStatus.SUCCEEDED
-                for dependency in step.depends_on
-            )
+            and all(step_runs[dependency].status == StepStatus.SUCCEEDED for dependency in step.depends_on)
         ]
 
     @staticmethod
@@ -59,8 +56,7 @@ class PlanScheduler:
                 failed_dependencies = [
                     dependency
                     for dependency in step.depends_on
-                    if step_runs[dependency].status
-                    in {StepStatus.FAILED, StepStatus.BLOCKED}
+                    if step_runs[dependency].status in {StepStatus.FAILED, StepStatus.BLOCKED}
                 ]
                 if failed_dependencies:
                     run.block("依赖步骤失败：" + ", ".join(failed_dependencies))
@@ -68,16 +64,11 @@ class PlanScheduler:
 
     @staticmethod
     def is_complete(step_runs: dict[str, StepRun]) -> bool:
-        return bool(step_runs) and all(
-            run.status == StepStatus.SUCCEEDED for run in step_runs.values()
-        )
+        return bool(step_runs) and all(run.status == StepStatus.SUCCEEDED for run in step_runs.values())
 
     @staticmethod
     def has_failed(step_runs: dict[str, StepRun]) -> bool:
-        return any(
-            run.status in {StepStatus.FAILED, StepStatus.BLOCKED}
-            for run in step_runs.values()
-        )
+        return any(run.status in {StepStatus.FAILED, StepStatus.BLOCKED} for run in step_runs.values())
 
 
 __all__ = ["PlanScheduler", "create_direct_plan", "create_step_runs"]

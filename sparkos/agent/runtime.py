@@ -116,9 +116,7 @@ class AgentRuntime:
         self.skills = load_skills() if skills is None else skills
         self.tools = list(TOOL_DEFINITIONS) if tools is None else tools
         self.tool_executor = tool_executor
-        self.planner = planner or (
-            LLMPlanner(self.client, max_steps=rt.max_steps) if enable_planning else None
-        )
+        self.planner = planner or (LLMPlanner(self.client, max_steps=rt.max_steps) if enable_planning else None)
         self.max_tool_rounds = max_tool_rounds
         self.task_store = task_store if task_store is not None else JsonTaskStore()
         self.scheduler = scheduler or PlanScheduler()
@@ -127,6 +125,9 @@ class AgentRuntime:
             tools=self.tools,
             tool_executor=self.tool_executor,
             max_tool_rounds=max_tool_rounds,
+            tool_call_limits={
+                "ask_advisor": rt.max_advisor_calls_per_step,
+            },
         )
         if replanner is not None:
             self.replanner = replanner
@@ -296,8 +297,7 @@ class AgentRuntime:
                 if answer:
                     chunks = (
                         execution.text_chunks
-                        if execution is not None
-                        and "".join(execution.text_chunks).strip() == answer
+                        if execution is not None and "".join(execution.text_chunks).strip() == answer
                         else ()
                     )
                     if chunks:
@@ -322,9 +322,7 @@ class AgentRuntime:
 
                     pending_deltas.append(delta)
                     prefix = "".join(answer_parts).lstrip().casefold()
-                    if "<tool_call".startswith(prefix) or prefix.startswith(
-                        "<tool_call"
-                    ):
+                    if "<tool_call".startswith(prefix) or prefix.startswith("<tool_call"):
                         continue
 
                     streaming_started = True
@@ -406,10 +404,7 @@ class AgentRuntime:
             "success": result.success,
             "output": result.output,
             "evidence": list(result.evidence),
-            "artifacts": [
-                {"uri": artifact.uri, "kind": artifact.kind}
-                for artifact in result.artifacts
-            ],
+            "artifacts": [{"uri": artifact.uri, "kind": artifact.kind} for artifact in result.artifacts],
             "error": result.error,
         }
 
@@ -417,12 +412,7 @@ class AgentRuntime:
     def _fallback_answer(cls, plan: Plan, step_runs: dict[str, StepRun]) -> str:
         for step in reversed(plan.steps):
             result = step_runs[step.id].result
-            if (
-                result is not None
-                and result.success
-                and result.output
-                and not cls._is_textual_tool_call(result.output)
-            ):
+            if result is not None and result.success and result.output and not cls._is_textual_tool_call(result.output):
                 return result.output
         return "未能生成有效的最终回答，请重试。"
 
@@ -437,11 +427,7 @@ class AgentRuntime:
         content: str,
     ) -> None:
         insertion_index = next(
-            (
-                index
-                for index, message in enumerate(messages)
-                if message.role != "system"
-            ),
+            (index for index, message in enumerate(messages) if message.role != "system"),
             len(messages),
         )
         messages.insert(
@@ -538,9 +524,7 @@ class AgentRuntime:
         return True
 
     def _planning_context(self) -> PlanningContext:
-        tool_names = tuple(
-            tool.get("function", {}).get("name", "") for tool in self.tools
-        )
+        tool_names = tuple(tool.get("function", {}).get("name", "") for tool in self.tools)
         return PlanningContext(
             session_id=self.context.session_id,
             summary=self.context.summary,

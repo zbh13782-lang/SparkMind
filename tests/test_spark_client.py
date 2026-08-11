@@ -79,9 +79,7 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             repo_root = Path(directory)
             compose_file = repo_root / "docker-compose.yml"
             compose_file.write_text("services: {}", encoding="utf-8")
-            runner = SparkJobRunner(
-                SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file)
-            )
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
             process = FakeProcess()
 
             with patch(
@@ -104,9 +102,7 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             assert "spark-client" in command
             assert "spark://spark-master:7077" in command
             assert "spark.driver.bindAddress=0.0.0.0" in command
-            assert any(
-                a.startswith("spark.driver.host=sparkmind-job-") for a in command
-            )
+            assert any(a.startswith("spark.driver.host=sparkmind-job-") for a in command)
             assert "sh" not in command
             assert "-c" not in command
             assert result.status == "succeeded"
@@ -116,9 +112,7 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             repo_root = Path(directory)
             compose_file = repo_root / "docker-compose.yml"
             compose_file.write_text("services: {}", encoding="utf-8")
-            runner = SparkJobRunner(
-                SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file)
-            )
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
 
             with patch(
                 "sparkos.infrastructure.spark.client.asyncio.create_subprocess_exec",
@@ -133,9 +127,7 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             job_dir = repo_root / "artifacts" / "spark-jobs" / result.job_id
-            assert (job_dir / "query.sql").read_text(
-                encoding="utf-8"
-            ) == "select 1 as value"
+            assert (job_dir / "query.sql").read_text(encoding="utf-8") == "select 1 as value"
             wrapper = (job_dir / "job.py").read_text(encoding="utf-8")
             assert "result.show(n=200, truncate=False)" in wrapper
 
@@ -144,9 +136,7 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             repo_root = Path(directory)
             compose_file = repo_root / "docker-compose.yml"
             compose_file.write_text("services: {}", encoding="utf-8")
-            runner = SparkJobRunner(
-                SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file)
-            )
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
 
             async def launch(*args: object, **kwargs: object) -> FakeProcess:
                 log_file = kwargs["stdout"]
@@ -191,9 +181,7 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             repo_root = Path(directory)
             compose_file = repo_root / "docker-compose.yml"
             compose_file.write_text("services: {}", encoding="utf-8")
-            runner = SparkJobRunner(
-                SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file)
-            )
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
             processes = [HangingProcess(), FakeProcess(), FakeProcess()]
 
             with patch(
@@ -209,13 +197,7 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
                     )
                 )
 
-            cleanup_commands = [
-                call.args for call in create_process.await_args_list[1:]
-            ]
-            assert any(
-                command[:2] == ("docker", "stop") for command in cleanup_commands
-            )
-            assert any(
-                command[:3] == ("docker", "rm", "-f") for command in cleanup_commands
-            )
+            cleanup_commands = [call.args for call in create_process.await_args_list[1:]]
+            assert any(command[:2] == ("docker", "stop") for command in cleanup_commands)
+            assert any(command[:3] == ("docker", "rm", "-f") for command in cleanup_commands)
             assert result.status == "timed_out"

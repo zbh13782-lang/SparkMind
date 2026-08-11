@@ -41,9 +41,7 @@ class FileBrowserScreen(Screen):
         await self._populate()
 
     async def _populate(self) -> None:
-        self.query_one("#file-browser-path", Static).update(
-            f"目录：{self._current_dir}"
-        )
+        self.query_one("#file-browser-path", Static).update(f"目录：{self._current_dir}")
         container = self.query_one("#file-list", VerticalScroll)
         await container.remove_children()
 

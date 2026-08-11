@@ -219,19 +219,11 @@ class ChatApp(App):
         ]
 
         # 匹配内置命令
-        matched_builtin = [
-            (cmd, desc)
-            for cmd, desc in builtin_commands
-            if cmd[1:].casefold().startswith(prefix)
-        ]
+        matched_builtin = [(cmd, desc) for cmd, desc in builtin_commands if cmd[1:].casefold().startswith(prefix)]
 
         # 匹配 skill
         skills = load_skills()
-        matched_skills = [
-            (f"/{s.name}", s.description)
-            for s in skills
-            if s.name.casefold().startswith(prefix)
-        ]
+        matched_skills = [(f"/{s.name}", s.description) for s in skills if s.name.casefold().startswith(prefix)]
 
         all_matches = matched_builtin + matched_skills
 
@@ -342,10 +334,7 @@ class ChatApp(App):
                 elif isinstance(event, PlanCreated):
                     status.update(f"已生成计划（{len(event.plan.steps)} 步）")
                 elif isinstance(event, PlanReplanned):
-                    status.update(
-                        f"已重新规划（v{event.plan.version}，"
-                        f"{len(event.plan.steps)} 步）"
-                    )
+                    status.update(f"已重新规划（v{event.plan.version}，{len(event.plan.steps)} 步）")
                 elif isinstance(event, StepStarted):
                     status.update(f"正在执行: {event.step.description}")
                 elif isinstance(event, StepCompleted):

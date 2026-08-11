@@ -11,6 +11,9 @@ dependencies = [
     "ruff>=0.16.1",
 ]
 
+[tool.ruff]
+line-length = 120
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["sparkos*"]

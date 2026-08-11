@@ -41,9 +41,7 @@ class HistoryScreen(Screen):
         display = sessions if expanded else sessions[:10]
 
         for s in display:
-            first_msg = (
-                s.messages[0].get("content", "")[:50] if s.messages else "(空会话)"
-            )
+            first_msg = s.messages[0].get("content", "")[:50] if s.messages else "(空会话)"
             time_str = s.created_at[:19].replace("T", " ")
             label = f"{first_msg}\n{time_str} · {len(s.messages)} 条消息"
 

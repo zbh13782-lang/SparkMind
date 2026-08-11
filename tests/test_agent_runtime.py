@@ -66,9 +66,7 @@ class FakeReplanner:
         self.plan = plan
         self.calls = []
 
-    async def revise_plan(
-        self, task, context, current_plan, step_runs, failed_step, reason
-    ):
+    async def revise_plan(self, task, context, current_plan, step_runs, failed_step, reason):
         self.calls.append({"task": task, "reason": reason})
         if self.plan is None:
             return None

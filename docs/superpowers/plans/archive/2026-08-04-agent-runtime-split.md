@@ -146,13 +146,9 @@ Expected: all context tests pass.
 async def test_runtime_records_assistant_call_before_tool_result(self):
     client = FakeClient(turns=[[ToolCall("c1", "read_file", "{}")], ["done"]])
     context = AgentContext()
-    runtime = AgentRuntime(
-        context=context, client=client, tools=[], tool_executor=lambda *_: "ok"
-    )
+    runtime = AgentRuntime(context=context, client=client, tools=[], tool_executor=lambda *_: "ok")
     await collect(runtime.run(AgentTask(goal="work")))
-    self.assertEqual(
-        [m.role for m in context.history], ["user", "assistant", "tool", "assistant"]
-    )
+    self.assertEqual([m.role for m in context.history], ["user", "assistant", "tool", "assistant"])
     self.assertEqual(context.history[2].tool_call_id, "c1")
 ```
 

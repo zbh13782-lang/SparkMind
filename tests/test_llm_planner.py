@@ -86,9 +86,7 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
     async def test_simple_task_returns_none(self) -> None:
         model = FakePlanningModel('{"should_plan": false, "steps": []}')
 
-        plan = await LLMPlanner(model).create_plan(
-            AgentTask(goal="Say hello"), planning_context()
-        )
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Say hello"), planning_context())
 
         self.assertIsNone(plan)
 
@@ -103,9 +101,7 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        decision = await LLMPlanner(model).create_plan(
-            AgentTask(goal="帮我分析一下"), planning_context()
-        )
+        decision = await LLMPlanner(model).create_plan(AgentTask(goal="帮我分析一下"), planning_context())
 
         self.assertEqual(
             decision,
@@ -113,26 +109,21 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_blank_clarification_falls_back_to_direct_execution(self) -> None:
-        model = FakePlanningModel(
-            '{"should_plan":false,"clarification_question":"  ","steps":[]}'
-        )
+        model = FakePlanningModel('{"should_plan":false,"clarification_question":"  ","steps":[]}')
 
-        decision = await LLMPlanner(model).create_plan(
-            AgentTask(goal="帮我处理"), planning_context()
-        )
+        decision = await LLMPlanner(model).create_plan(AgentTask(goal="帮我处理"), planning_context())
 
         self.assertIsNone(decision)
 
     async def test_markdown_fenced_json_is_accepted(self) -> None:
         model = FakePlanningModel(
             """```json
-{"should_plan": true, "steps": [{"id": "s1", "description": "Inspect", "depends_on": []}]}
+{"should_plan": true, "steps": [{"id": "s1", "description": "Inspect",
+ "depends_on": []}]}
 ```"""
         )
 
-        plan = await LLMPlanner(model).create_plan(
-            AgentTask(goal="Inspect the project"), planning_context()
-        )
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Inspect the project"), planning_context())
 
         self.assertIsNotNone(plan)
         assert plan is not None
@@ -141,9 +132,7 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_json_falls_back_to_direct_execution(self) -> None:
         model = FakePlanningModel("not json")
 
-        plan = await LLMPlanner(model).create_plan(
-            AgentTask(goal="Do work"), planning_context()
-        )
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Do work"), planning_context())
 
         self.assertIsNone(plan)
 
@@ -160,13 +149,10 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_dependency_rejects_plan(self) -> None:
         model = FakePlanningModel(
-            '{"should_plan":true,"steps":['
-            '{"id":"s1","description":"Inspect","depends_on":["missing"]}]}'
+            '{"should_plan":true,"steps":[{"id":"s1","description":"Inspect","depends_on":["missing"]}]}'
         )
 
-        plan = await LLMPlanner(model).create_plan(
-            AgentTask(goal="Do work"), planning_context()
-        )
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Do work"), planning_context())
 
         self.assertIsNone(plan)
 
@@ -177,9 +163,7 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
             '{"id":"s2","description":"Two","depends_on":["s1"]}]}'
         )
 
-        plan = await LLMPlanner(model).create_plan(
-            AgentTask(goal="Do work"), planning_context()
-        )
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Do work"), planning_context())
 
         self.assertIsNone(plan)
 
@@ -190,55 +174,36 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
             '{"id":"s1","description":"Two","depends_on":[]}]}'
         )
 
-        plan = await LLMPlanner(model).create_plan(
-            AgentTask(goal="Do work"), planning_context()
-        )
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Do work"), planning_context())
 
         self.assertIsNone(plan)
 
     async def test_self_dependency_rejects_plan(self) -> None:
-        model = FakePlanningModel(
-            '{"should_plan":true,"steps":['
-            '{"id":"s1","description":"One","depends_on":["s1"]}]}'
-        )
+        model = FakePlanningModel('{"should_plan":true,"steps":[{"id":"s1","description":"One","depends_on":["s1"]}]}')
 
-        plan = await LLMPlanner(model).create_plan(
-            AgentTask(goal="Do work"), planning_context()
-        )
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Do work"), planning_context())
 
         self.assertIsNone(plan)
 
     async def test_plan_over_configured_step_limit_is_rejected(self) -> None:
-        steps = [
-            {"id": f"s{index}", "description": str(index), "depends_on": []}
-            for index in range(3)
-        ]
+        steps = [{"id": f"s{index}", "description": str(index), "depends_on": []} for index in range(3)]
         model = FakePlanningModel(json.dumps({"should_plan": True, "steps": steps}))
 
-        plan = await LLMPlanner(model, max_steps=2).create_plan(
-            AgentTask(goal="Do work"), planning_context()
-        )
+        plan = await LLMPlanner(model, max_steps=2).create_plan(AgentTask(goal="Do work"), planning_context())
 
         self.assertIsNone(plan)
 
     async def test_prompt_uses_configured_step_limit(self) -> None:
         model = FakePlanningModel('{"should_plan": false, "steps": []}')
 
-        await LLMPlanner(model, max_steps=2).create_plan(
-            AgentTask(goal="Do work"), planning_context()
-        )
+        await LLMPlanner(model, max_steps=2).create_plan(AgentTask(goal="Do work"), planning_context())
 
         self.assertIn("最多 2 步", model.requests[0][0]["content"])
 
     async def test_empty_step_description_rejects_plan(self) -> None:
-        model = FakePlanningModel(
-            '{"should_plan":true,"steps":['
-            '{"id":"s1","description":"  ","depends_on":[]}]}'
-        )
+        model = FakePlanningModel('{"should_plan":true,"steps":[{"id":"s1","description":"  ","depends_on":[]}]}')
 
-        plan = await LLMPlanner(model).create_plan(
-            AgentTask(goal="Do work"), planning_context()
-        )
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Do work"), planning_context())
 
         self.assertIsNone(plan)
 

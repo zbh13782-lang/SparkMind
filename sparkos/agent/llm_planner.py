@@ -136,9 +136,7 @@ class LLMPlanner(Planner):
             "goal": task.goal,
             "input": task.input,
             "summary": context.summary,
-            "recent_messages": [
-                message.to_api_dict() for message in context.recent_messages
-            ],
+            "recent_messages": [message.to_api_dict() for message in context.recent_messages],
             "skills": [
                 {
                     "name": skill.name,
@@ -151,9 +149,7 @@ class LLMPlanner(Planner):
         return [
             {
                 "role": "system",
-                "content": _PLANNER_PROMPT_TEMPLATE.replace(
-                    "{max_steps}", str(self.max_steps)
-                ),
+                "content": _PLANNER_PROMPT_TEMPLATE.replace("{max_steps}", str(self.max_steps)),
             },
             {
                 "role": "user",
@@ -174,27 +170,18 @@ class LLMPlanner(Planner):
             "goal": task.goal,
             "input": task.input,
             "summary": context.summary,
-            "recent_messages": [
-                message.to_api_dict() for message in context.recent_messages
-            ],
-            "skills": [
-                {"name": skill.name, "description": skill.description}
-                for skill in context.skills
-            ],
+            "recent_messages": [message.to_api_dict() for message in context.recent_messages],
+            "skills": [{"name": skill.name, "description": skill.description} for skill in context.skills],
             "tools": list(context.tool_names),
             "current_plan": self._serialize_plan(current_plan),
-            "step_runs": {
-                step_id: self._serialize_run(run) for step_id, run in step_runs.items()
-            },
+            "step_runs": {step_id: self._serialize_run(run) for step_id, run in step_runs.items()},
             "failed_step": self._serialize_step(failed_step),
             "failure_reason": reason,
         }
         return [
             {
                 "role": "system",
-                "content": _REPLAN_PROMPT_TEMPLATE.replace(
-                    "{max_steps}", str(self.max_steps)
-                ),
+                "content": _REPLAN_PROMPT_TEMPLATE.replace("{max_steps}", str(self.max_steps)),
             },
             {
                 "role": "user",
@@ -257,22 +244,15 @@ class LLMPlanner(Planner):
             if not isinstance(description, str) or not description.strip():
                 raise ValueError(f"步骤 {step_id} 的描述不能为空")
             if not isinstance(depends_on, list) or not all(
-                isinstance(dependency, str) and dependency.strip()
-                for dependency in depends_on
+                isinstance(dependency, str) and dependency.strip() for dependency in depends_on
             ):
                 raise ValueError(f"步骤 {step_id} 的 depends_on 无效")
-            if success_criteria is not None and (
-                not isinstance(success_criteria, str) or not success_criteria.strip()
-            ):
+            if success_criteria is not None and (not isinstance(success_criteria, str) or not success_criteria.strip()):
                 raise ValueError(f"步骤 {step_id} 的 success_criteria 无效")
 
-            normalized_dependencies = tuple(
-                dependency.strip() for dependency in depends_on
-            )
+            normalized_dependencies = tuple(dependency.strip() for dependency in depends_on)
             normalized_criteria = (
-                success_criteria.strip()
-                if success_criteria is not None
-                else f"完成步骤：{description.strip()}"
+                success_criteria.strip() if success_criteria is not None else f"完成步骤：{description.strip()}"
             )
             steps.append(
                 PlanStep(
@@ -348,10 +328,7 @@ class LLMPlanner(Planner):
             "success": result.success,
             "output": result.output,
             "evidence": list(result.evidence),
-            "artifacts": [
-                {"uri": artifact.uri, "kind": artifact.kind}
-                for artifact in result.artifacts
-            ],
+            "artifacts": [{"uri": artifact.uri, "kind": artifact.kind} for artifact in result.artifacts],
             "error": result.error,
         }
 

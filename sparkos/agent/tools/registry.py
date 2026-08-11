@@ -1,15 +1,16 @@
-"""通用工具定义：read_file / write_file / shell / web_fetch / run_spark_job。"""
+"""通用工具定义：read_file / write_file / web_fetch / run_spark_job / run_code。"""
 
 from __future__ import annotations
 
-import os
-import subprocess
 from collections.abc import Awaitable
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from sparkos.infrastructure.advisor.service import AdvisorService
+from sparkos.infrastructure.code_sandbox.models import CodeRunRequest
+from sparkos.infrastructure.code_sandbox.runner import CodeSandboxRunner
 from sparkos.infrastructure.spark.client import SparkJobRunner
 from sparkos.infrastructure.spark.models import SparkJobRequest
 
@@ -55,23 +56,6 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
-            "name": "shell",
-            "description": "执行 shell 命令并返回输出结果。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "要执行的 shell 命令",
-                    }
-                },
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "web_fetch",
             "description": "获取指定 URL 的网页内容，返回文本。",
             "parameters": {
@@ -90,7 +74,9 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_spark_job",
-            "description": "在本地 Docker Spark 集群同步执行一条 Spark SQL 或一个 PySpark 作业，并返回状态、日志末尾和作业信息。",
+            "description": (
+                "在本地 Docker Spark 集群同步执行一条 Spark SQL 或一个 PySpark 作业，并返回状态、日志末尾和作业信息。"
+            ),
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
@@ -122,10 +108,71 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_code",
+            "description": (
+                "在无网络、无宿主工作区访问的一次性 Docker 沙箱中运行 Python 或 Bash，"
+                "返回退出码、限长输出和完整日志路径。"
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "language": {"type": "string", "enum": ["python", "bash"]},
+                    "code": {"type": "string", "description": "要运行的完整代码"},
+                    "stdin": {"type": "string", "default": ""},
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 30,
+                        "default": 10,
+                    },
+                },
+                "required": ["language", "code"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_advisor",
+            "description": (
+                "当当前步骤经过一次具体尝试后仍存在关键技术难题或方案分歧时，"
+                "向独立高级模型请求一次建议；建议必须再用当前工具或证据验证。"
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "question": {"type": "string", "description": "需要决策的具体问题"},
+                    "context": {
+                        "type": "string",
+                        "description": "最小必要上下文和约束",
+                    },
+                    "attempts": {
+                        "type": "string",
+                        "description": "已经尝试的方法及结果",
+                    },
+                },
+                "required": ["question", "context", "attempts"],
+            },
+        },
+    },
 ]
 
 
 _SPARK_RUNNER = SparkJobRunner()
+_CODE_RUNNER = CodeSandboxRunner()
+_ADVISOR: AdvisorService | None = None
+
+
+def _get_advisor() -> AdvisorService:
+    global _ADVISOR
+    if _ADVISOR is None:
+        _ADVISOR = AdvisorService.from_config()
+    return _ADVISOR
 
 
 def execute_tool(
@@ -137,12 +184,14 @@ def execute_tool(
         return _read_file(arguments["path"])
     if name == "write_file":
         return _write_file(arguments["path"], arguments["content"])
-    if name == "shell":
-        return _shell(arguments["command"])
     if name == "web_fetch":
         return _web_fetch(arguments["url"])
     if name == "run_spark_job":
         return _run_spark_job(arguments)
+    if name == "run_code":
+        return _run_code(arguments)
+    if name == "ask_advisor":
+        return _ask_advisor(arguments)
     return f"未知工具: {name}"
 
 
@@ -158,6 +207,29 @@ async def _run_spark_job(arguments: dict[str, Any]) -> str:
         timeout_seconds=int(arguments.get("timeout_seconds", 600)),
     )
     result = await _SPARK_RUNNER.run(request)
+    return result.to_json()
+
+
+async def _run_code(arguments: dict[str, Any]) -> str:
+    request = CodeRunRequest(
+        language=arguments["language"],
+        code=arguments["code"],
+        stdin=arguments.get("stdin", ""),
+        timeout_seconds=int(arguments.get("timeout_seconds", 10)),
+    )
+    result = await _CODE_RUNNER.run(request)
+    return result.to_json()
+
+
+async def _ask_advisor(arguments: dict[str, Any]) -> str:
+    from sparkos.infrastructure.advisor.models import AdvisorRequest
+
+    request = AdvisorRequest(
+        question=arguments["question"],
+        context=arguments["context"],
+        attempts=arguments["attempts"],
+    )
+    result = await _get_advisor().ask(request)
     return result.to_json()
 
 
@@ -185,28 +257,6 @@ def _write_file(path: str, content: str) -> str:
     return f"已写入文件: {path} ({len(content)} 字节)"
 
 
-def _shell(command: str) -> str:
-    """执行 shell 命令。"""
-    try:
-        result = subprocess.run(
-            command,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=os.getcwd(),
-            check=False,
-        )
-        output = result.stdout or result.stderr
-        if not output:
-            output = "(命令无输出)"
-        return f"退出码: {result.returncode}\n{output}"
-    except subprocess.TimeoutExpired:
-        return "命令执行超时（30 秒）"
-    except Exception as e:  # noqa: BLE001
-        return f"执行错误: {e}"
-
-
 def _web_fetch(url: str) -> str:
     """获取网页内容。"""
     try:
@@ -217,3 +267,9 @@ def _web_fetch(url: str) -> str:
             return f"网页内容 ({url}, {len(text)} 字符):\n{text[:5000]}"
     except Exception as e:  # noqa: BLE001
         return f"获取失败: {e}"
+
+
+__all__ = [
+    "TOOL_DEFINITIONS",
+    "execute_tool",
+]

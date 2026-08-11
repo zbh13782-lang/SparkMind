@@ -99,21 +99,15 @@ class ChatAppLayoutTests(unittest.IsolatedAsyncioTestCase):
             chat = app.query_one("#chat", VerticalScroll)
             summary = ToolCallSummary()
             await chat.mount(summary)
-            await summary.add_tool(
-                ToolCall("call-1", "read_file", "[unsafe]", "first result")
-            )
-            await summary.add_tool(
-                ToolCall("call-2", "shell", '{"cmd":"pwd"}', "second result")
-            )
+            await summary.add_tool(ToolCall("call-1", "read_file", "[unsafe]", "first result"))
+            await summary.add_tool(ToolCall("call-2", "shell", '{"cmd":"pwd"}', "second result"))
             summary.complete()
             await pilot.pause()
 
             self.assertEqual(len(chat.query(".tool-summary")), 1)
             self.assertEqual(summary.title, "执行了 2 个工具")
             self.assertEqual(len(summary.query(".tool-call")), 2)
-            details = [
-                widget.render().plain for widget in summary.query(".tool-detail")
-            ]
+            details = [widget.render().plain for widget in summary.query(".tool-detail")]
             self.assertIn("[unsafe]", details[0])
             self.assertIn("second result", details[1])
 
@@ -230,9 +224,7 @@ class ChatAppLayoutTests(unittest.IsolatedAsyncioTestCase):
             async def run(self, task: AgentTask, skill_name: str | None = None):
                 del task, skill_name
                 self.call_count += 1
-                started = (
-                    self.first_started if self.call_count == 1 else self.second_started
-                )
+                started = self.first_started if self.call_count == 1 else self.second_started
                 started.set()
                 await asyncio.Event().wait()
                 if False:

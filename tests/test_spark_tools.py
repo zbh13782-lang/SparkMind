@@ -11,11 +11,7 @@ from sparkos.infrastructure.spark.models import SparkJobResult
 
 class TestSparkToolTests(unittest.IsolatedAsyncioTestCase):
     def test_registry_exposes_one_spark_tool(self) -> None:
-        spark_tools = [
-            item["function"]
-            for item in TOOL_DEFINITIONS
-            if "spark" in item["function"]["name"]
-        ]
+        spark_tools = [item["function"] for item in TOOL_DEFINITIONS if "spark" in item["function"]["name"]]
 
         assert [tool["name"] for tool in spark_tools] == ["run_spark_job"]
         assert spark_tools[0]["parameters"]["properties"]["job_type"]["enum"] == [

@@ -80,9 +80,7 @@ def build_system_messages(
     return messages
 
 
-def load_skill_content(
-    name: str, skills_dir: str = "sparkos/agent/skills"
-) -> str | None:
+def load_skill_content(name: str, skills_dir: str = "sparkos/agent/skills") -> str | None:
     """读取指定 skill 的完整 SKILL.md 内容。"""
     path = Path(skills_dir) / name / "SKILL.md"
     if not path.is_file():
@@ -120,9 +118,7 @@ class SkillSuggester:
         if not value.startswith("/"):
             return []
         prefix = value[1:].casefold()
-        return [
-            f"/{s.name}" for s in self._skills if s.name.casefold().startswith(prefix)
-        ]
+        return [f"/{s.name}" for s in self._skills if s.name.casefold().startswith(prefix)]
 
 
 def _parse_description(path: Path) -> str:
@@ -145,10 +141,6 @@ def _parse_description(path: Path) -> str:
                 frontmatter = yaml.safe_load(raw[3:end]) or {}
             except Exception:  # noqa: BLE001
                 return ""
-            return (
-                frontmatter.get("description", "").strip()
-                if isinstance(frontmatter, dict)
-                else ""
-            )
+            return frontmatter.get("description", "").strip() if isinstance(frontmatter, dict) else ""
 
     return ""

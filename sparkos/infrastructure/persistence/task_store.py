@@ -54,10 +54,7 @@ class JsonTaskStore:
             "saved_at": datetime.now(UTC).isoformat(),
             "task": self._serialize_task(task),
             "plan": serialized_plan,
-            "step_runs": {
-                step_id: self._serialize_step_run(run)
-                for step_id, run in step_runs.items()
-            },
+            "step_runs": {step_id: self._serialize_step_run(run) for step_id, run in step_runs.items()},
             "plan_history": plan_history,
         }
         try:
@@ -120,9 +117,7 @@ class JsonTaskStore:
             "success": result.success,
             "output": result.output,
             "evidence": list(result.evidence),
-            "artifacts": [
-                cls._serialize_artifact(artifact) for artifact in result.artifacts
-            ],
+            "artifacts": [cls._serialize_artifact(artifact) for artifact in result.artifacts],
             "error": result.error,
         }
 

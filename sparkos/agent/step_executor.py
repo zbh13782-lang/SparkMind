@@ -63,6 +63,7 @@ class StepExecutor:
         tools: list[dict[str, Any]],
         tool_executor: ToolExecutor | None,
         max_tool_rounds: int = 8,
+        tool_call_limits: dict[str, int] | None = None,
     ) -> None:
         if max_tool_rounds < 0:
             raise ValueError("max_tool_rounds 不能小于 0")
@@ -70,6 +71,12 @@ class StepExecutor:
         self.tools = tools
         self.tool_executor = tool_executor
         self.max_tool_rounds = max_tool_rounds
+        self.tool_call_limits: dict[str, int] = {}
+        if tool_call_limits:
+            for name, limit in tool_call_limits.items():
+                if not name or not isinstance(limit, int) or limit < 1:
+                    raise ValueError(f"tool_call_limits 中的 {name!r} 无效")
+                self.tool_call_limits[name] = limit
 
     async def execute(
         self,
@@ -109,6 +116,7 @@ class StepExecutor:
         executed_calls: list[ToolCall] = []
         tool_rounds = 0
         empty_result_retries = 0
+        tool_call_counts: dict[str, int] = {}
 
         while True:
             turn_parts: list[str] = []
@@ -137,11 +145,7 @@ class StepExecutor:
                 ) from exc
 
             turn_text = "".join(turn_parts)
-            serialized_calls = (
-                [tool_call.to_api_dict() for tool_call in tool_calls]
-                if tool_calls
-                else None
-            )
+            serialized_calls = [tool_call.to_api_dict() for tool_call in tool_calls] if tool_calls else None
             assistant_message = ChatMessage(
                 role="assistant",
                 content=turn_text,
@@ -150,11 +154,7 @@ class StepExecutor:
             messages.append(assistant_message)
             transcript.append(assistant_message.to_api_dict())
             if not tool_calls:
-                if (
-                    not turn_text.strip()
-                    and executed_calls
-                    and empty_result_retries == 0
-                ):
+                if not turn_text.strip() and executed_calls and empty_result_retries == 0:
                     empty_result_retries += 1
                     retry_message = ChatMessage(
                         role="system",
@@ -203,6 +203,30 @@ class StepExecutor:
             tool_rounds += 1
             tool_result_messages = []
             for index, tool_call in enumerate(tool_calls):
+                limit = self.tool_call_limits.get(tool_call.name)
+                if limit is not None:
+                    count = tool_call_counts.get(tool_call.name, 0)
+                    if count >= limit:
+                        error_msg = f"工具调用次数超过单步限制（{tool_call.name}: {limit}）"
+                        tool_call.result = error_msg
+                        tool_message = self._append_tool_result(messages, tool_call)
+                        serialized_tool_message = tool_message.to_api_dict()
+                        transcript.append(serialized_tool_message)
+                        tool_result_messages.append(serialized_tool_message)
+                        yield StepToolExecution(
+                            tool_call=tool_call,
+                            transcript=tuple(deepcopy(transcript)),
+                            history_messages=(
+                                self._tool_round_history(
+                                    assistant_message,
+                                    tool_result_messages,
+                                )
+                                if index == len(tool_calls) - 1
+                                else ()
+                            ),
+                        )
+                        continue
+                    tool_call_counts[tool_call.name] = count + 1
                 tool_call.result = await self._execute_tool_call(tool_call)
                 executed_calls.append(tool_call)
                 tool_message = self._append_tool_result(messages, tool_call)
@@ -257,8 +281,7 @@ class StepExecutor:
                 "success_criteria": step.success_criteria,
             },
             "dependencies": {
-                step_id: StepExecutor._serialize_result(result)
-                for step_id, result in dependency_results.items()
+                step_id: StepExecutor._serialize_result(result) for step_id, result in dependency_results.items()
             },
         }
         step_message = ChatMessage(
@@ -270,11 +293,7 @@ class StepExecutor:
             ),
         )
         insertion_index = next(
-            (
-                index
-                for index, message in enumerate(messages)
-                if message.role != "system"
-            ),
+            (index for index, message in enumerate(messages) if message.role != "system"),
             len(messages),
         )
         messages.insert(insertion_index, step_message)
@@ -285,10 +304,7 @@ class StepExecutor:
             "success": result.success,
             "output": result.output,
             "evidence": list(result.evidence),
-            "artifacts": [
-                StepExecutor._serialize_artifact(artifact)
-                for artifact in result.artifacts
-            ],
+            "artifacts": [StepExecutor._serialize_artifact(artifact) for artifact in result.artifacts],
             "error": result.error,
         }
 

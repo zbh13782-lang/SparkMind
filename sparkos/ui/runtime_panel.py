@@ -133,20 +133,14 @@ class RuntimeTrace:
             self._record(f"等待补充 · {event.question}")
         elif isinstance(event, PlanReplanned):
             previous_steps = {step.id: step for step in event.previous_plan.steps}
-            unchanged_steps = {
-                step.id
-                for step in event.plan.steps
-                if previous_steps.get(step.id) == step
-            }
+            unchanged_steps = {step.id for step in event.plan.steps if previous_steps.get(step.id) == step}
             self._load_plan(
                 event.plan,
                 preserve_completed_ids=unchanged_steps,
             )
             self.task_status = "running"
             self._record(f"重新规划 · v{event.plan.version}")
-            if self.step_order and all(
-                self.steps[step_id].status == "succeeded" for step_id in self.step_order
-            ):
+            if self.step_order and all(self.steps[step_id].status == "succeeded" for step_id in self.step_order):
                 self._set_phase("responding")
                 self._record("准备最终回答")
             else:
@@ -164,16 +158,12 @@ class RuntimeTrace:
             step.tool_count += 1
             self._set_phase("tooling")
             self._record(f"{step.id} · 工具 {event.tool_call.name}")
-            self.total_tokens += count_messages(
-                [ChatMessage(role="tool", content=event.tool_call.result)]
-            )
+            self.total_tokens += count_messages([ChatMessage(role="tool", content=event.tool_call.result)])
         elif isinstance(event, StepCompleted):
             step = self._ensure_step(event.step)
             step.status = "succeeded"
             self._record(f"{step.id} · 步骤完成")
-            if self.step_order and all(
-                self.steps[step_id].status == "succeeded" for step_id in self.step_order
-            ):
+            if self.step_order and all(self.steps[step_id].status == "succeeded" for step_id in self.step_order):
                 self._set_phase("responding")
                 self._record("准备最终回答")
             else:
@@ -186,9 +176,7 @@ class RuntimeTrace:
             if self.phase != "responding":
                 self._set_phase("responding")
                 self._record("生成最终回答")
-            self.total_tokens += count_messages(
-                [ChatMessage(role="assistant", content=event.text)]
-            )
+            self.total_tokens += count_messages([ChatMessage(role="assistant", content=event.text)])
         elif isinstance(event, TaskCompleted):
             self.task_status = "succeeded"
             self.phase = "completed"
@@ -232,9 +220,7 @@ class RuntimeTrace:
         output.append(self._render_phases())
 
         if self.step_order:
-            completed = sum(
-                self.steps[step_id].status == "succeeded" for step_id in self.step_order
-            )
+            completed = sum(self.steps[step_id].status == "succeeded" for step_id in self.step_order)
             plan_meta = f"PLAN v{self.plan_version}  {completed}/{len(self.step_order)}"
             output.append("\n\n")
             output.append(plan_meta, style="bold")
@@ -263,11 +249,7 @@ class RuntimeTrace:
         steps: dict[str, RuntimeStepView] = {}
         for plan_step in plan.steps:
             previous = prior.get(plan_step.id)
-            if (
-                plan_step.id in preserve_completed_ids
-                and previous is not None
-                and previous.status == "succeeded"
-            ):
+            if plan_step.id in preserve_completed_ids and previous is not None and previous.status == "succeeded":
                 steps[plan_step.id] = previous
             else:
                 steps[plan_step.id] = RuntimeStepView(
