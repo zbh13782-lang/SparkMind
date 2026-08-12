@@ -31,3 +31,4 @@ sparkmind.egg-info/
 .sparkmind/
 artifacts/
 data/
+.codegraph/

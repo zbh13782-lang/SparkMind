@@ -6,6 +6,8 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Literal
 
+from config.config import AdvisorConfig
+
 AdvisorStatus = Literal["succeeded", "failed", "timed_out", "disabled"]
 
 

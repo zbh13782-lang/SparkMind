@@ -22,8 +22,8 @@ runtime:
 advisor:
   enabled: true
   base_url: "http://localhost:20128/v1"   # 改为你自己的 advisor 网关
-  api_key: ""                              # 改为你自己的 advisor key
-  model: "advisor"                        # 理论上，这个应该是更为高级的模型，比如主模型sonnet，这个就配置opus
+  api_key: "sk-54027ea1b7cab6a1-9yi909-90d259c0"                              # 改为你自己的 advisor key
+  model: "plans"                        # 理论上，这个应该是更为高级的模型，比如主模型sonnet，这个就配置opus
   timeout_seconds: 90
   max_question_chars: 4000
   max_context_chars: 16000

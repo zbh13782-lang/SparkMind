@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import traceback
 from asyncio import sleep as async_sleep
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from rich.text import Text
 from textual import events, work
@@ -158,10 +158,11 @@ class ChatApp(App):
         ("escape", "cancel_generation", "停止生成"),
     ]
 
-    def __init__(self) -> None:
+    def __init__(self, tools: list[dict[str, Any]] | None = None) -> None:
         super().__init__()
         self.runtime = AgentRuntime(
             enable_planning=True,
+            tools=tools,
         )
         self._generation_worker: object | None = None
 
