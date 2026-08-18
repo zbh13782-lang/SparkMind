@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +16,7 @@ from sparkos.infrastructure.spark.models import SparkJobRequest, SparkJobResult
 # ── model tests ──────────────────────────────────────────────────────────────
 
 
-class TestSparkJobModelTests(unittest.TestCase):
+class TestSparkJobModel(unittest.TestCase):
     def test_request_rejects_invalid_resource_values(self) -> None:
         with pytest.raises(ValueError, match="executor_memory"):
             SparkJobRequest(
@@ -73,7 +74,7 @@ class FakeProcess:
         self.returncode = -9
 
 
-class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
+class TestSparkJobRunner(unittest.IsolatedAsyncioTestCase):
     async def test_pyspark_job_uses_one_off_client_without_shell(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo_root = Path(directory)
@@ -130,6 +131,35 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             assert (job_dir / "query.sql").read_text(encoding="utf-8") == "select 1 as value"
             wrapper = (job_dir / "job.py").read_text(encoding="utf-8")
             assert "result.show(n=200, truncate=False)" in wrapper
+            assert ".enableHiveSupport()" in wrapper
+
+    async def test_job_uses_repo_persisted_hive_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo_root = Path(directory)
+            compose_file = repo_root / "docker-compose.yml"
+            compose_file.write_text("services: {}", encoding="utf-8")
+            runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
+
+            with patch(
+                "sparkos.infrastructure.spark.client.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=FakeProcess()),
+            ) as create_process:
+                await runner.run(
+                    SparkJobRequest(
+                        job_name="hive-catalog",
+                        job_type="spark_sql",
+                        code="show tables in sparkmind_demo",
+                    )
+                )
+
+            command = create_process.await_args.args
+            assert "spark.sql.catalogImplementation=hive" in command
+            assert "spark.sql.warehouse.dir=file:/opt/sparkos/data/hive/warehouse" in command
+            assert any(
+                arg.startswith("spark.hadoop.javax.jdo.option.ConnectionURL=jdbc:derby:")
+                and "/opt/sparkos/data/hive/metastore_db" in arg
+                for arg in command
+            )
 
     async def test_result_keeps_application_id_but_only_returns_log_tail(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -139,11 +169,11 @@ class TestSparkJobRunnerTests(unittest.IsolatedAsyncioTestCase):
             runner = SparkJobRunner(SparkRunnerConfig(repo_root=repo_root, compose_file=compose_file))
 
             async def launch(*args: object, **kwargs: object) -> FakeProcess:
-                log_file = kwargs["stdout"]
-                log_file.write(b"Connected with app ID app-1722920000000-0001\n")
-                log_file.write(b"x" * 25_000)
-                log_file.write(b"\nfinal-result\n")
-                log_file.flush()
+                log_fd = kwargs["stdout"]
+                os.write(log_fd, b"Connected with app ID app-1722920000000-0001\n")
+                os.write(log_fd, b"x" * 25_000)
+                os.write(log_fd, b"\nfinal-result\n")
+                os.fsync(log_fd)
                 return FakeProcess()
 
             with patch(

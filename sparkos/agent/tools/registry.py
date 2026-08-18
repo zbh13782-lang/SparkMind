@@ -238,6 +238,12 @@ def _read_file(path: str) -> str:
     p = Path(path)
     if not p.is_absolute():
         p = Path.cwd() / p
+    try:
+        p = p.resolve()
+    except OSError:
+        return f"无法解析文件路径: {path}"
+    if not p.is_relative_to(Path.cwd().resolve()):
+        return f"文件路径超出工作目录: {path}"
     if not p.exists():
         return f"文件不存在: {path}"
     try:
@@ -252,6 +258,12 @@ def _write_file(path: str, content: str) -> str:
     p = Path(path)
     if not p.is_absolute():
         p = Path.cwd() / p
+    try:
+        p = p.resolve()
+    except OSError:
+        return f"无法解析文件路径: {path}"
+    if not p.is_relative_to(Path.cwd().resolve()):
+        return f"文件路径超出工作目录: {path}"
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return f"已写入文件: {path} ({len(content)} 字节)"

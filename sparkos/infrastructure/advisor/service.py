@@ -73,7 +73,7 @@ class AdvisorService:
                 )
         except asyncio.CancelledError:
             raise
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return AdvisorResult(
                 status="timed_out",
                 model=self.config.model,

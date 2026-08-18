@@ -7,24 +7,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - 每次修改完成 Py 代码之后，使用 ruff 检查并 format（`ruff check --fix . && ruff format .`，line-length=120）。
 - 使用中文回复用户消息。
 
-## 常用命令
-
-```bash
-.venv/bin/python main.py                 # 运行 Agent（先跑 preflight 健康检查，再进 Textual TUI）
-.venv/bin/python -m pytest tests/ -q     # 全量测试（pytest + IsolatedAsyncioTestCase，无 pytest-asyncio）
-.venv/bin/python -m pytest tests/test_agent_runtime.py -q   # 单文件
-.venv/bin/python -m pytest tests/test_scheduler.py::TestPlanScheduler::test_ready_steps -q  # 单条
-```
-
-外部依赖（非全部必需，preflight 会降级）：
-
-```bash
-docker compose up -d spark-master spark-worker spark-history   # 本地 Spark 集群
-docker build -f docker/code-sandbox.Dockerfile -t sparkmind-code-sandbox:latest docker  # run_code 沙箱镜像
-```
-
-LLM / Advisor 走 OpenAI 兼容网关，配置在 `config/config.yaml`，可用 `SPARKMIND_ADVISOR_*` 环境变量覆盖。
-
 ## 架构
 
 数据分析 Agent，CLI/TUI 形态。分层：`sparkos/agent`（核心链路）→ `sparkos/infrastructure`（外部能力）→ `sparkos/ui`（Textual 界面）。入口 `main.py` 做 preflight（LLM 失败硬退出，Docker/Advisor 降级继续）后启动 `ChatApp`。

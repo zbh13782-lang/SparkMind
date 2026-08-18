@@ -72,7 +72,7 @@ class CodeSandboxRunner:
             process = await asyncio.create_subprocess_exec(
                 *command,
                 stdin=stdin_r,
-                stdout=log_file,
+                stdout=log_file.fileno(),
                 stderr=asyncio.subprocess.STDOUT,
             )
         except OSError:

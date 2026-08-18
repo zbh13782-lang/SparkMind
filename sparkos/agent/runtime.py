@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import AsyncIterator
 from typing import Any, Protocol
 
@@ -418,8 +419,7 @@ class AgentRuntime:
 
     @staticmethod
     def _is_textual_tool_call(text: str) -> bool:
-        normalized = text.lstrip().casefold()
-        return normalized.startswith("<tool_call")
+        return bool(re.search(r"<tool_call", text.lstrip(), re.IGNORECASE))
 
     @staticmethod
     def _insert_system_message(

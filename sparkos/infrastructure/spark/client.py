@@ -72,7 +72,7 @@ class SparkJobRunner:
                     *command,
                     cwd=self.config.repo_root,
                     env=env,
-                    stdout=log_file,
+                    stdout=log_file.fileno(),
                     stderr=asyncio.subprocess.STDOUT,
                 )
                 try:
@@ -118,7 +118,9 @@ class SparkJobRunner:
                     "from pathlib import Path",
                     "from pyspark.sql import SparkSession",
                     "",
-                    f"spark = SparkSession.builder.appName({request.job_name!r}).getOrCreate()",
+                    f"spark = (SparkSession.builder.appName({request.job_name!r})",
+                    "         .enableHiveSupport()",
+                    "         .getOrCreate())",
                     "try:",
                     f"    query = Path({container_sql_path!r}).read_text(encoding='utf-8').strip().rstrip(';')",
                     "    result = spark.sql(query)",
@@ -170,6 +172,12 @@ class SparkJobRunner:
             f"spark.driver.host={container_name}",
             "--conf",
             "spark.driver.bindAddress=0.0.0.0",
+            "--conf",
+            "spark.sql.catalogImplementation=hive",
+            "--conf",
+            "spark.sql.warehouse.dir=file:/opt/sparkos/data/hive/warehouse",
+            "--conf",
+            "spark.hadoop.javax.jdo.option.ConnectionURL=jdbc:derby:;databaseName=/opt/sparkos/data/hive/metastore_db;create=true",
             self._container_path(script_path),
         ]
 

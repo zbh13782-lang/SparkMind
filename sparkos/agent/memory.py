@@ -41,7 +41,7 @@ def list_sessions() -> list[Session]:
                     summary_upto=data.get("summary_upto", 0),
                 )
             )
-        except json.JSONDecodeError, KeyError:
+        except (json.JSONDecodeError, KeyError):
             continue
     return sessions
 
@@ -60,7 +60,7 @@ def load_session(session_id: str) -> Session | None:
             summary=data.get("summary", ""),
             summary_upto=data.get("summary_upto", 0),
         )
-    except json.JSONDecodeError, KeyError:
+    except (json.JSONDecodeError, KeyError):
         return None
 
 
@@ -83,7 +83,7 @@ def save_session(
             created_at = existing.get("created_at", created_at)
             existing_summary = existing.get("summary", "")
             existing_upto = existing.get("summary_upto", 0)
-        except json.JSONDecodeError, KeyError:
+        except (json.JSONDecodeError, KeyError):
             pass
 
     path.write_text(

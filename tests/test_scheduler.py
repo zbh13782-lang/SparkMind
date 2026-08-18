@@ -35,7 +35,7 @@ def sample_plan() -> Plan:
     )
 
 
-class PlanSchedulerTests(unittest.TestCase):
+class TestPlanScheduler(unittest.TestCase):
     def test_only_dependency_ready_steps_are_returned(self) -> None:
         plan = sample_plan()
         runs = create_step_runs(plan)

@@ -90,3 +90,13 @@ sparkos/
 ```
 
 异步测试继承 `unittest.IsolatedAsyncioTestCase`；类名必须 `Test*` 开头。历史踩坑见 `docs/mistakes.md`。
+
+## Spark 测试数据
+
+仓库提供可扩展的零售测试数据生成器，包含分区 CSV、嵌套 JSON、数据质量异常，以及装载后的持久 Hive 表：
+
+```bash
+.venv/bin/python scripts/generate_spark_test_data.py --preset small
+```
+
+详细表结构、Hive 装载命令、规模档位和分析题见 [Spark 测试数据集](docs/spark-test-data.md)。

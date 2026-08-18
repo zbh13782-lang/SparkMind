@@ -18,9 +18,9 @@ def _get_encoding(model: str) -> tiktoken.Encoding | None:
 
     if model not in _TOKENIZER_CACHE:
         try:
-            _TOKENIZER_CACHE[model] = tiktoken.encoding_for_model(model)
-        except KeyError:
             _TOKENIZER_CACHE[model] = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _TOKENIZER_CACHE[model] = None
     return _TOKENIZER_CACHE[model]
 
 
