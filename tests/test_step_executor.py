@@ -124,6 +124,51 @@ class StepExecutorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.requests[1][-1]["tool_call_id"], "c1")
         self.assertEqual(len(original_messages), 2)
 
+    async def test_large_tool_result_is_bounded_before_next_model_round(self) -> None:
+        call = ToolCall(call_id="c1", name="run_spark_job", arguments="{}")
+        client = FakeStepClient(turns=[[call], ["done"]])
+        executor = StepExecutor(
+            client=client,
+            tools=[],
+            tool_executor=lambda *_: "x" * 30_000,
+        )
+
+        execution = await executor.execute(
+            task=AgentTask(goal="query"),
+            step=sample_step(),
+            dependency_results={},
+            base_messages=base_messages(),
+        )
+
+        self.assertEqual(execution.result.output, "done")
+        tool_message = client.requests[1][-1]
+        self.assertLessEqual(len(tool_message["content"]), StepExecutor.MAX_TOOL_RESULT_CHARS)
+        self.assertIn("结果已截断", tool_message["content"])
+
+    async def test_tool_context_is_bounded_across_multiple_rounds(self) -> None:
+        calls = [ToolCall(call_id=f"c{i}", name="run_spark_job", arguments="{}") for i in range(3)]
+        client = FakeStepClient(turns=[[calls[0]], [calls[1]], [calls[2]], ["done"]])
+        executor = StepExecutor(
+            client=client,
+            tools=[],
+            tool_executor=lambda *_: "y" * 11_000,
+        )
+
+        await executor.execute(
+            task=AgentTask(goal="query"),
+            step=sample_step(),
+            dependency_results={},
+            base_messages=base_messages(),
+        )
+
+        final_request = client.requests[-1]
+        tool_chars = sum(
+            len(message.get("content", ""))
+            for message in final_request
+            if message.get("role") == "tool"
+        )
+        self.assertLessEqual(tool_chars, StepExecutor.MAX_TOOL_CONTEXT_CHARS)
+
     async def test_result_uses_only_final_non_tool_assistant_turn(self) -> None:
         call = ToolCall(call_id="c1", name="read_file", arguments="{}")
         client = FakeStepClient(turns=[["reading", call], ["final result"]])

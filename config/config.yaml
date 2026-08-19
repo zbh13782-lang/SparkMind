@@ -28,3 +28,13 @@ advisor:
   max_question_chars: 4000
   max_context_chars: 16000
   max_attempts_chars: 8000
+
+# 动态数据目录
+catalog:
+  enabled: true
+  default_database: sparkmind_demo
+  cache_path: artifacts/catalog/catalog.json
+  cache_ttl_seconds: 300
+  semantic_path: config/semantic_catalog.yaml
+  max_tables_per_response: 50
+  max_columns_per_response: 200

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from pathlib import Path
 from typing import ClassVar
 from unittest.mock import AsyncMock, call, patch
 
@@ -11,6 +12,7 @@ from textual.widgets import Input, Markdown
 from sparkos.agent.events import (
     ClarificationRequested,
     PlanCreated,
+    SkillActivated,
     StepStarted,
     StepToolCompleted,
     TaskCompleted,
@@ -19,10 +21,12 @@ from sparkos.agent.events import (
 from sparkos.agent.llm_planner import LLMPlanner
 from sparkos.agent.planner import Plan, PlanStep
 from sparkos.agent.runtime import AgentRuntime
+from sparkos.agent.skills.loader import Skill
 from sparkos.agent.task import AgentTask
 from sparkos.infrastructure.llm.models import ToolCall
 from sparkos.ui.chat_app import ChatApp
 from sparkos.ui.runtime_panel import RuntimePanel
+from sparkos.ui.skill_summary import SkillActivationSummary
 from sparkos.ui.tool_summary import ToolCallSummary
 
 
@@ -40,6 +44,39 @@ class ChatAppIntegrationTests(unittest.TestCase):
 
 
 class ChatAppLayoutTests(unittest.IsolatedAsyncioTestCase):
+    async def test_activated_skills_are_grouped_under_one_summary(self) -> None:
+        class SkillRuntime:
+            skills: ClassVar[list[Skill]] = [
+                Skill(
+                    name="data-quality-test",
+                    description="查询数据并执行多维质量测试。",
+                    path=Path("sparkos/agent/skills/data-quality-test/SKILL.md"),
+                )
+            ]
+
+            async def run(self, task: AgentTask, skill_name: str | None = None):
+                del skill_name
+                yield SkillActivated(self.skills[0], source="rule")
+                yield TextDelta("done")
+                task.succeed("done")
+                yield TaskCompleted(task)
+
+        app = ChatApp()
+        app.runtime = SkillRuntime()  # type: ignore[assignment]
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            prompt = app.query_one("#prompt", Input)
+            await app.on_input_submitted(Input.Submitted(prompt, "查询订单并做质量测试"))
+            await pilot.pause()
+
+            summary = app.query(".skill-summary").first(SkillActivationSummary)
+            self.assertEqual(summary.title, "激活了 1 个技能")
+            self.assertEqual(len(summary.query(".skill-call")), 1)
+            self.assertIn("data-quality-test", summary.query(".skill-call").first().title)
+            detail = summary.query(".skill-detail").first().render().plain
+            self.assertIn("查询数据并执行多维质量测试", detail)
+            self.assertIn("规则触发", detail)
+
     async def test_text_deltas_are_rendered_with_frame_pacing(self) -> None:
         class StreamingRuntime:
             skills: ClassVar[list[object]] = []

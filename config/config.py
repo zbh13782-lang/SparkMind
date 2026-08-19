@@ -58,6 +58,17 @@ class AdvisorConfig:
     max_attempts_chars: int
 
 
+@dataclass(frozen=True)
+class CatalogConfig:
+    enabled: bool
+    default_database: str
+    cache_path: str
+    cache_ttl_seconds: int
+    semantic_path: str
+    max_tables_per_response: int
+    max_columns_per_response: int
+
+
 def load(path: str | None = None) -> dict:
     """读取 YAML 文件，返回原始字典。"""
     path = path or os.path.join(os.path.dirname(__file__), "config.yaml")
@@ -137,3 +148,24 @@ def get_advisor_config(path: str | None = None) -> AdvisorConfig:
         max_context_chars=max_context_chars,
         max_attempts_chars=max_attempts_chars,
     )
+
+
+def get_catalog_config(path: str | None = None) -> CatalogConfig:
+    """读取动态数据 Catalog 配置。"""
+    cfg = load(path).get("catalog", {})
+    config = CatalogConfig(
+        enabled=bool(cfg.get("enabled", True)),
+        default_database=str(cfg.get("default_database", "default")).strip(),
+        cache_path=str(cfg.get("cache_path", "artifacts/catalog/catalog.json")),
+        cache_ttl_seconds=int(cfg.get("cache_ttl_seconds", 300)),
+        semantic_path=str(cfg.get("semantic_path", "config/semantic_catalog.yaml")),
+        max_tables_per_response=int(cfg.get("max_tables_per_response", 50)),
+        max_columns_per_response=int(cfg.get("max_columns_per_response", 200)),
+    )
+    if not config.default_database:
+        raise ValueError("catalog.default_database 不能为空")
+    if config.cache_ttl_seconds < 0:
+        raise ValueError("catalog.cache_ttl_seconds 不能小于 0")
+    if config.max_tables_per_response < 1 or config.max_columns_per_response < 1:
+        raise ValueError("catalog 返回数量限制必须为正整数")
+    return config

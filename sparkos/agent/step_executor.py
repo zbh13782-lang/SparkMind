@@ -57,6 +57,11 @@ class StepExecution:
 
 
 class StepExecutor:
+    # Tool output is fed back into the model on the next round.  Keep that
+    # per-round payload bounded even when a query prints hundreds of rows.
+    MAX_TOOL_RESULT_CHARS = 12_000
+    MAX_TOOL_CONTEXT_CHARS = 24_000
+
     def __init__(
         self,
         client: StepModel,
@@ -121,6 +126,7 @@ class StepExecutor:
         while True:
             turn_parts: list[str] = []
             tool_calls: list[ToolCall] = []
+            self._trim_tool_context(messages)
             try:
                 async for item in self.client.chat_stream(
                     messages,
@@ -302,11 +308,41 @@ class StepExecutor:
     def _serialize_result(result: StepResult) -> dict[str, Any]:
         return {
             "success": result.success,
-            "output": result.output,
-            "evidence": list(result.evidence),
+            "output": StepExecutor._truncate(result.output),
+            "evidence": [StepExecutor._truncate(item, 1000) for item in result.evidence[:20]],
             "artifacts": [StepExecutor._serialize_artifact(artifact) for artifact in result.artifacts],
             "error": result.error,
         }
+
+    @staticmethod
+    def _truncate(text: str, limit: int = 12_000) -> str:
+        if len(text) <= limit:
+            return text
+        marker = f"\n[结果已截断，原长度 {len(text)} 字符]"
+        return f"{text[: max(0, limit - len(marker))]}{marker}"[:limit]
+
+    @classmethod
+    def _trim_tool_context(cls, messages: list[ChatMessage]) -> None:
+        """Bound accumulated tool payload while preserving API message pairs.
+
+        Older tool messages are shortened first; the assistant tool-call
+        messages and the newest results remain available for the next turn.
+        """
+        tool_messages = [message for message in messages if message.role == "tool"]
+        total = sum(len(message.content or "") for message in tool_messages)
+        if total <= cls.MAX_TOOL_CONTEXT_CHARS:
+            return
+
+        for message in tool_messages:
+            if total <= cls.MAX_TOOL_CONTEXT_CHARS:
+                break
+            content = message.content or ""
+            excess = total - cls.MAX_TOOL_CONTEXT_CHARS
+            target = max(256, len(content) - excess)
+            if target >= len(content):
+                continue
+            message.content = cls._truncate(content, target)
+            total = sum(len(item.content or "") for item in tool_messages)
 
     @staticmethod
     def _serialize_artifact(artifact: ArtifactRef) -> dict[str, str]:
@@ -351,7 +387,7 @@ class StepExecutor:
                 )
             if inspect.isawaitable(result):
                 result = await result
-            return str(result)
+            return self._truncate(str(result), self.MAX_TOOL_RESULT_CHARS)
         except Exception as exc:  # noqa: BLE001
             return f"工具执行失败：{type(exc).__name__}: {exc}"
 

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -112,7 +110,7 @@ class CodeSandboxRunnerTests(unittest.IsolatedAsyncioTestCase):
             new_callable=AsyncMock,
         ) as create_process:
             proc_mock = AsyncMock()
-            proc_mock.communicate = AsyncMock(side_effect=asyncio.TimeoutError())
+            proc_mock.communicate = AsyncMock(side_effect=TimeoutError())
             create_process.return_value = proc_mock
 
             result = await runner.run(CodeRunRequest("python", "print('slow')", timeout_seconds=1))

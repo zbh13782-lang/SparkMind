@@ -107,6 +107,34 @@ def parse_slash_command(text: str, skills: list[Skill]) -> tuple[str | None, str
     return skill_name, message
 
 
+def infer_skill_name(text: str, skills: list[Skill]) -> str | None:
+    """Infer narrowly-scoped skills whose activation requires explicit intent."""
+    available = {skill.name for skill in skills}
+    if "data-quality-test" not in available:
+        return None
+
+    normalized = text.casefold()
+    query_terms = ("查询", "查一下", "查下", "检索", "query", "select")
+    quality_terms = (
+        "质量测试",
+        "质量检查",
+        "质量检测",
+        "数据质量",
+        "检查质量",
+        "检测质量",
+        "分析质量",
+        "分析一下质量",
+        "quality test",
+        "quality check",
+        "data quality",
+    )
+    if any(term in normalized for term in query_terms) and any(
+        term in normalized for term in quality_terms
+    ):
+        return "data-quality-test"
+    return None
+
+
 class SkillSuggester:
     """为 Input 提供 skill 名称的自动补全。"""
 

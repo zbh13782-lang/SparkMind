@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,9 +11,12 @@ import yaml
 from config.config import (
     ChatConfig,
     get_advisor_config,
+    get_catalog_config,
     get_chat_config,
     load,
 )
+
+_SPARK_HIVE_CHECK_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -70,7 +74,7 @@ async def check_llm() -> CheckResult:
             [{"role": "user", "content": "hi"}],
             json_object=False,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return CheckResult(ok=False, detail=f"LLM 不可达: {exc}")
 
     if not reply.strip():
@@ -88,9 +92,11 @@ async def check_docker() -> CheckResult:
             return CheckResult(ok=False, detail="docker 命令未找到", degraded=True)
         import subprocess
 
-        result = subprocess.run(
+        result = await asyncio.to_thread(
+            subprocess.run,
             ["docker", "info"],
             capture_output=True,
+            check=False,
             timeout=5,
         )
         if result.returncode != 0:
@@ -103,9 +109,57 @@ async def check_docker() -> CheckResult:
         return CheckResult(ok=False, detail="docker 命令未找到", degraded=True)
     except subprocess.TimeoutExpired:
         return CheckResult(ok=False, detail="docker 响应超时", degraded=True)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return CheckResult(ok=False, detail=f"docker 检查异常: {exc}", degraded=True)
     return CheckResult(ok=True, detail="docker 正常")
+
+
+async def check_spark_hive(catalog_service: object | None = None) -> CheckResult:
+    """通过一次 Catalog 刷新验证 Spark 集群、Hive Metastore 和默认数据库。"""
+    try:
+        config = get_catalog_config()
+    except (KeyError, TypeError, ValueError) as exc:
+        return CheckResult(ok=False, detail=f"Catalog 配置缺失: {exc}", degraded=True)
+
+    if not config.enabled:
+        return CheckResult(ok=True, detail="Catalog 已禁用")
+
+    if catalog_service is None:
+        from sparkos.infrastructure.catalog.service import CatalogService
+
+        catalog_service = CatalogService.from_config()
+
+    from sparkos.infrastructure.catalog.models import CatalogQuery
+
+    try:
+        async with asyncio.timeout(_SPARK_HIVE_CHECK_TIMEOUT_SECONDS):
+            result = await catalog_service.get_catalog(  # type: ignore[attr-defined]
+                CatalogQuery(database=config.default_database, refresh=True)
+            )
+    except TimeoutError:
+        return CheckResult(ok=False, detail="Spark/Hive 检查超时（超过 30 秒）", degraded=True)
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(ok=False, detail=f"Spark/Hive 检查异常: {exc}", degraded=True)
+
+    status = str(result.get("status", "unknown"))
+    if status != "succeeded":
+        return CheckResult(
+            ok=False,
+            detail=f"Spark/Hive 检查失败 [{status}]: {result.get('error', 'Catalog 不可用')}",
+            degraded=True,
+        )
+
+    tables = result.get("tables", [])
+    if not isinstance(tables, list) or not tables:
+        return CheckResult(
+            ok=False,
+            detail=f"Spark/Hive 正常，但默认数据库 {config.default_database} 暂无表",
+            degraded=True,
+        )
+    return CheckResult(
+        ok=True,
+        detail=f"Spark/Hive 正常 [{config.default_database}]，发现 {len(tables)} 张表",
+    )
 
 
 async def check_advisor() -> CheckResult:
@@ -139,7 +193,7 @@ async def check_advisor() -> CheckResult:
             [{"role": "user", "content": "hi"}],
             json_object=False,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return CheckResult(
             ok=False,
             detail=f"Advisor 不可达 ({config.model}): {exc}",

@@ -6,8 +6,7 @@ import asyncio
 import time
 from typing import Protocol
 
-from config.config import ChatConfig, get_advisor_config
-from config.config import AdvisorConfig
+from config.config import AdvisorConfig, ChatConfig, get_advisor_config
 from sparkos.infrastructure.advisor.models import AdvisorRequest, AdvisorResult
 from sparkos.infrastructure.llm.client import OpenAIChatClient
 

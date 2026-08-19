@@ -8,8 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from config.config import (
-    AdvisorConfig,
     get_advisor_config,
+    get_catalog_config,
     get_runtime_config,
 )
 
@@ -106,9 +106,8 @@ class AdvisorConfigTests(unittest.TestCase):
             tmp_path = f.name
 
         try:
-            with patch.dict(os.environ, {}, clear=True):
-                with self.assertRaises(ValueError):
-                    get_advisor_config(tmp_path)
+            with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
+                get_advisor_config(tmp_path)
         finally:
             os.unlink(tmp_path)
 
@@ -160,9 +159,8 @@ class AdvisorConfigTests(unittest.TestCase):
             tmp_path = f.name
 
         try:
-            with patch.dict(os.environ, {}, clear=True):
-                with self.assertRaises(ValueError):
-                    get_advisor_config(tmp_path)
+            with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
+                get_advisor_config(tmp_path)
         finally:
             os.unlink(tmp_path)
 
@@ -171,3 +169,26 @@ class RuntimeConfigTests(unittest.TestCase):
     def test_runtime_includes_advisor_limit(self) -> None:
         config = get_runtime_config()
         self.assertEqual(config.max_advisor_calls_per_step, 1)
+
+
+class CatalogConfigTests(unittest.TestCase):
+    def test_catalog_config_reads_values_and_defaults(self) -> None:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False, encoding="utf-8") as f:
+            f.write(
+                "catalog:\n"
+                "  enabled: true\n"
+                "  default_database: analytics\n"
+                "  cache_ttl_seconds: 60\n"
+                "  max_tables_per_response: 20\n"
+                "  max_columns_per_response: 100\n"
+            )
+            tmp_path = f.name
+
+        try:
+            config = get_catalog_config(tmp_path)
+            self.assertTrue(config.enabled)
+            self.assertEqual(config.default_database, "analytics")
+            self.assertEqual(config.cache_ttl_seconds, 60)
+            self.assertEqual(config.cache_path, "artifacts/catalog/catalog.json")
+        finally:
+            os.unlink(tmp_path)

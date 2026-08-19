@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sparkos.agent.planner import Plan, PlanStep
+from sparkos.agent.skills.loader import Skill
 from sparkos.agent.step import StepResult
 from sparkos.agent.task import AgentTask
 from sparkos.infrastructure.llm.models import ToolCall
@@ -18,6 +19,13 @@ class TaskStarted:
 @dataclass(frozen=True)
 class PlanCreated:
     plan: Plan
+
+
+@dataclass(frozen=True)
+class SkillActivated:
+    skill: Skill
+    step: PlanStep | None = None
+    source: str = "rule"
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,7 @@ class TaskFailed:
 
 type AgentEvent = (
     TaskStarted
+    | SkillActivated
     | ClarificationRequested
     | PlanCreated
     | PlanReplanned
@@ -97,6 +106,7 @@ __all__ = [
     "ClarificationRequested",
     "PlanCreated",
     "PlanReplanned",
+    "SkillActivated",
     "StepCompleted",
     "StepFailed",
     "StepStarted",

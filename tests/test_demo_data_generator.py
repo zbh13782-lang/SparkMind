@@ -10,6 +10,12 @@ from scripts.generate_spark_test_data import DatasetConfig, generate_dataset
 
 
 class TestDemoDataGenerator(unittest.TestCase):
+    def test_loader_uses_python_38_compatible_utc_timezone(self) -> None:
+        source = (Path(__file__).resolve().parents[1] / "scripts/load_spark_test_data.py").read_text(encoding="utf-8")
+
+        assert "from datetime import UTC" not in source
+        assert "timezone.utc" in source
+
     def test_generates_relational_csv_and_nested_json_with_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "retail_demo"

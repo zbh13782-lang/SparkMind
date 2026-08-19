@@ -44,6 +44,10 @@ def planning_context() -> PlanningContext:
                 name="spark-sql",
                 description="Generate and optimize Spark SQL",
             ),
+            SkillCapability(
+                name="data-quality-test",
+                description="Test query result quality",
+            ),
         ),
         tool_names=("read_file", "shell"),
     )
@@ -60,12 +64,14 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
                             "id": "s1",
                             "description": "Inspect the input data",
                             "depends_on": [],
+                            "skills": ["spark-sql"],
                             "success_criteria": "Input schema is known",
                         },
                         {
                             "id": "s2",
                             "description": "Write the findings",
                             "depends_on": ["s1"],
+                            "skills": ["data-quality-test"],
                             "success_criteria": "Findings are summarized",
                         },
                     ],
@@ -81,6 +87,8 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.task_id, task.id)
         self.assertEqual([step.id for step in plan.steps], ["s1", "s2"])
         self.assertEqual(plan.steps[1].depends_on, ("s1",))
+        self.assertEqual(plan.steps[0].skills, ("spark-sql",))
+        self.assertEqual(plan.steps[1].skills, ("data-quality-test",))
         self.assertEqual(plan.steps[1].success_criteria, "Findings are summarized")
 
     async def test_simple_task_returns_none(self) -> None:
@@ -156,6 +164,28 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(plan)
 
+    async def test_unknown_skill_rejects_plan(self) -> None:
+        model = FakePlanningModel(
+            '{"should_plan":true,"steps":['
+            '{"id":"s1","description":"Inspect","depends_on":[],"skills":["missing-skill"]}]}'
+        )
+
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Do work"), planning_context())
+
+        self.assertIsNone(plan)
+
+    async def test_duplicate_step_skills_are_normalized(self) -> None:
+        model = FakePlanningModel(
+            '{"should_plan":true,"steps":['
+            '{"id":"s1","description":"Inspect","depends_on":[],"skills":["spark-sql","spark-sql"]}]}'
+        )
+
+        plan = await LLMPlanner(model).create_plan(AgentTask(goal="Do work"), planning_context())
+
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.steps[0].skills, ("spark-sql",))
+
     async def test_dependency_cycle_rejects_plan(self) -> None:
         model = FakePlanningModel(
             '{"should_plan":true,"steps":['
@@ -226,7 +256,11 @@ class LLMPlannerTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "name": "spark-sql",
                     "description": "Generate and optimize Spark SQL",
-                }
+                },
+                {
+                    "name": "data-quality-test",
+                    "description": "Test query result quality",
+                },
             ],
         )
         self.assertEqual(payload["tools"], ["read_file", "shell"])

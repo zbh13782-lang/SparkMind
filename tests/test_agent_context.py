@@ -30,6 +30,39 @@ class AgentContextTests(unittest.TestCase):
         self.assertEqual(context.history[-1].tool_call_id, "call-1")
         self.assertEqual(context.history[-1].content, "result")
 
+    def test_build_messages_includes_compact_catalog_summary(self) -> None:
+        context = AgentContext()
+
+        messages = context.build_messages(
+            skills=[],
+            tools=[],
+            catalog_summary={
+                "default_database": "sparkmind_demo",
+                "tables": ["fact_order", "fact_event"],
+            },
+        )
+
+        system_text = "\n".join(message.content for message in messages if message.role == "system")
+        self.assertIn("sparkmind_demo", system_text)
+        self.assertIn("fact_order", system_text)
+
+    def test_build_messages_bounds_large_tool_history(self) -> None:
+        context = AgentContext()
+        context.record_user("分析数据")
+        context.record_tool("call-1", "x" * 20_000)
+
+        messages = context.build_messages(
+            skills=[],
+            tools=[],
+            max_history_chars=1_000,
+        )
+
+        history_text = "\n".join(
+            message.content for message in messages if message.role != "system"
+        )
+        self.assertLessEqual(len(history_text), 1_000)
+        self.assertIn("已截断", history_text)
+
     def test_assistant_tool_call_is_preserved_during_serialization(self) -> None:
         context = AgentContext()
         call = ToolCall(call_id="call-1", name="read_file", arguments="{}")

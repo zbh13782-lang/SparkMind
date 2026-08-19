@@ -7,8 +7,9 @@ or mutate task state directly; AgentRuntime owns those responsibilities.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from sparkos.agent.task import AgentTask
 from sparkos.infrastructure.llm.models import ChatMessage
@@ -30,6 +31,7 @@ class PlanStep:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
     depends_on: tuple[str, ...] = ()
     success_criteria: str = ""
+    skills: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,7 @@ class PlanningContext:
     recent_messages: tuple[ChatMessage, ...]
     skills: tuple[SkillCapability, ...]
     tool_names: tuple[str, ...]
+    catalog_summary: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def skill_names(self) -> tuple[str, ...]:

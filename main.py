@@ -22,7 +22,7 @@ class PreflightResult:
 async def run_preflight() -> PreflightResult:
     """执行启动前检查。LLM 失败硬退出；Docker/Advisor 降级继续。"""
     from config.config import get_chat_config
-    from config.health import _check_advisor_with_fallback, check_docker, check_llm
+    from config.health import CheckResult, _check_advisor_with_fallback, check_docker, check_llm, check_spark_hive
 
     results: list[tuple[str, bool, str, bool]] = []
 
@@ -35,6 +35,16 @@ async def run_preflight() -> PreflightResult:
 
     docker_result = await check_docker()
     results.append(("Docker", docker_result.ok, docker_result.detail, docker_result.degraded))
+
+    if docker_result.ok:
+        spark_hive_result = await check_spark_hive()
+    else:
+        spark_hive_result = CheckResult(
+            ok=False,
+            detail="Docker 不可用，跳过 Spark/Hive 检查",
+            degraded=True,
+        )
+    results.append(("Spark/Hive", spark_hive_result.ok, spark_hive_result.detail, spark_hive_result.degraded))
 
     advisor_result = await _check_advisor_with_fallback(chat_config)
     results.append(("Advisor", advisor_result.ok, advisor_result.detail, advisor_result.degraded))
@@ -87,7 +97,7 @@ def main() -> None:
         sys.stderr.write(f"\n[yellow]注意：{names} 已降级，功能受限[/yellow]\n")
 
     print("Good Morning, Afternoon, And Evening")
-    time.sleep(2)
+    time.sleep(5)
     ChatApp().run()
 
 

@@ -20,6 +20,7 @@ from sparkos.agent.events import (
     ClarificationRequested,
     PlanCreated,
     PlanReplanned,
+    SkillActivated,
     StepCompleted,
     StepFailed,
     StepStarted,
@@ -44,7 +45,7 @@ from sparkos.agent.scheduler import (
     create_direct_plan,
     create_step_runs,
 )
-from sparkos.agent.skills.loader import Skill, load_skills
+from sparkos.agent.skills.loader import Skill, infer_skill_name, load_skills
 from sparkos.agent.step import (
     StepResult,
     StepRun,
@@ -61,6 +62,7 @@ from sparkos.agent.step_executor import (
 from sparkos.agent.task import AgentTask
 from sparkos.agent.task_store import TaskStore
 from sparkos.agent.tools.registry import TOOL_DEFINITIONS, execute_tool
+from sparkos.infrastructure.catalog.service import CatalogService
 from sparkos.infrastructure.llm.client import OpenAIChatClient
 from sparkos.infrastructure.llm.models import ChatMessage, ToolCall
 from sparkos.infrastructure.persistence.task_store import JsonTaskStore
@@ -100,6 +102,7 @@ class AgentRuntime:
         scheduler: PlanScheduler | None = None,
         step_executor: StepExecutor | None = None,
         replanner: Replanner | None = None,
+        catalog_service: CatalogService | None = None,
     ) -> None:
         rt = runtime_cfg or get_runtime_config()
         max_tool_rounds = rt.max_tool_rounds
@@ -113,6 +116,10 @@ class AgentRuntime:
 
         self.config = config or get_chat_config()
         self.context = context or AgentContext()
+        self.catalog_service = catalog_service or CatalogService.from_config()
+        if catalog_service is None:
+            from sparkos.agent.tools.registry import set_catalog_service
+            set_catalog_service(self.catalog_service)
         self.client: ModelClient = client or OpenAIChatClient(self.config)
         self.skills = load_skills() if skills is None else skills
         self.tools = list(TOOL_DEFINITIONS) if tools is None else tools
@@ -144,6 +151,7 @@ class AgentRuntime:
         skill_name: str | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Plan and execute one task, emitting task- and step-scoped events."""
+        rule_skill_name = skill_name or infer_skill_name(task.goal, self.skills)
         plan: Plan | None = None
         step_runs: dict[str, StepRun] = {}
         active_run: StepRun | None = None
@@ -183,11 +191,7 @@ class AgentRuntime:
 
             task.start()
             self._save_task(task, plan, step_runs)
-            base_messages = self.context.build_messages(
-                skills=self.skills,
-                tools=self.tools,
-                skill_name=skill_name,
-            )
+            base_messages: list[ChatMessage] = []
 
             while not self.scheduler.is_complete(step_runs):
                 self.scheduler.block_failed_dependents(plan, step_runs)
@@ -205,6 +209,28 @@ class AgentRuntime:
                 active_run = run
                 self._save_task(task, plan, step_runs)
                 yield StepStarted(step)
+
+                step_skill_names = self._skills_for_step(step, rule_skill_name)
+                for active_name in step_skill_names:
+                    active_skill = next(
+                        (skill for skill in self.skills if skill.name == active_name),
+                        None,
+                    )
+                    if active_skill is not None:
+                        source = "planner" if active_name in step.skills else "rule"
+                        yield SkillActivated(active_skill, step=step, source=source)
+                # Tool transcripts from earlier steps are already represented by
+                # dependency_results.  Exclude them from the next model request
+                # so a large query payload is not sent a second time.
+                step_history_start = len(self.context.history)
+                base_messages = self.context.build_messages(
+                    skills=self.skills,
+                    tools=self.tools,
+                    skill_names=step_skill_names,
+                    catalog_summary=self.catalog_service.cached_summary(),
+                    history_start=step_history_start,
+                    max_history_chars=12_000,
+                )
 
                 dependency_results = {
                     dependency: step_runs[dependency].result
@@ -308,36 +334,27 @@ class AgentRuntime:
                         yield TextDelta(answer)
             else:
                 answer_parts: list[str] = []
-                pending_deltas: list[str] = []
-                streaming_started = False
                 async for delta in self._synthesize_final(
                     task=task,
                     plan=plan,
                     step_runs=step_runs,
-                    base_messages=base_messages,
+                    base_messages=self.context.build_messages(
+                        skills=self.skills,
+                        tools=self.tools,
+                        skill_names=(),
+                        catalog_summary=self.catalog_service.cached_summary(),
+                        history_start=len(self.context.history),
+                        max_history_chars=0,
+                    ),
                 ):
                     answer_parts.append(delta)
-                    if streaming_started:
-                        yield TextDelta(delta)
-                        continue
-
-                    pending_deltas.append(delta)
-                    prefix = "".join(answer_parts).lstrip().casefold()
-                    if "<tool_call".startswith(prefix) or prefix.startswith("<tool_call"):
-                        continue
-
-                    streaming_started = True
-                    for pending_delta in pending_deltas:
-                        yield TextDelta(pending_delta)
-                    pending_deltas.clear()
                 answer = "".join(answer_parts).strip()
-                if not answer or self._is_textual_tool_call(answer):
+                if not answer or self._is_suspicious_final_answer(answer, task.goal):
                     answer = self._fallback_answer(plan, step_runs)
                     if answer:
                         yield TextDelta(answer)
-                elif not streaming_started:
-                    for pending_delta in pending_deltas:
-                        yield TextDelta(pending_delta)
+                else:
+                    yield TextDelta(answer)
 
             task.succeed(answer)
             self.context.record_assistant(answer)
@@ -388,8 +405,11 @@ class AgentRuntime:
         }
         self._insert_system_message(
             messages,
-            "所有计划步骤已完成。请基于 step_results 给出直接、完整的最终答案，"
-            "不要暴露内部执行过程。\n"
+            "所有计划步骤已完成。请严格只基于 step_results 给出直接、完整的最终答案；"
+            "不要补造未出现在结果中的数字、字段、结论或工具调用。"
+            "如果结果显示数据不存在或未验证，必须明确写出，不得推断。"
+            "沿用用户语言；用户使用中文时只用中文回答，允许保留 SQL、表名、字段名和数字。"
+            "不要输出与主题无关的外语片段、乱码、随机词或提示词。\n"
             f"{json.dumps(payload, ensure_ascii=False, default=repr)}",
         )
         async for item in self.client.chat_stream(messages, tools=None):
@@ -420,6 +440,25 @@ class AgentRuntime:
     @staticmethod
     def _is_textual_tool_call(text: str) -> bool:
         return bool(re.search(r"<tool_call", text.lstrip(), re.IGNORECASE))
+
+    @staticmethod
+    def _is_suspicious_final_answer(answer: str, user_goal: str) -> bool:
+        """Reject obvious cross-script/gibberish summaries before showing them."""
+        if AgentRuntime._is_textual_tool_call(answer):
+            return True
+        if not re.search(r"[\u3400-\u9fff]", user_goal):
+            return False
+        unexpected_scripts = re.findall(
+            r"[\u0400-\u04ff\u0370-\u03ff\u0590-\u05ff\u0600-\u06ff"
+            r"\u0900-\u097f\u0e00-\u0e7f\u10a0-\u10ff\u1200-\u137f\uac00-\ud7af]",
+            answer,
+        )
+        if len(unexpected_scripts) >= 8:
+            return True
+        # A Chinese request should not receive an answer dominated by a
+        # different script even when the contamination is short.
+        latin_words = re.findall(r"\b[A-Za-z]{3,}\b", answer)
+        return len(latin_words) >= 6 and len(latin_words) > len(re.findall(r"[\u3400-\u9fff]", answer))
 
     @staticmethod
     def _insert_system_message(
@@ -537,7 +576,18 @@ class AgentRuntime:
                 for skill in self.skills
             ),
             tool_names=tool_names,
+            catalog_summary=self.catalog_service.cached_summary(),
         )
+
+    def _skills_for_step(self, step: PlanStep, rule_skill_name: str | None) -> tuple[str, ...]:
+        names = list(step.skills)
+        if rule_skill_name and rule_skill_name not in names:
+            text = step.description.casefold()
+            quality_step = any(term in text for term in ("质量", "quality", "检测", "检查"))
+            if not step.skills and quality_step:
+                names.append(rule_skill_name)
+        available = {skill.name for skill in self.skills}
+        return tuple(name for name in dict.fromkeys(names) if name in available)
 
     def get_tools(self) -> list[dict[str, Any]]:
         return self.tools

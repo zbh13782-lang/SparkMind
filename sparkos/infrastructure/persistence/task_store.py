@@ -97,6 +97,7 @@ class JsonTaskStore:
             "id": step.id,
             "description": step.description,
             "depends_on": list(step.depends_on),
+            "skills": list(step.skills),
             "success_criteria": step.success_criteria,
         }
 

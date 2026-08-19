@@ -17,6 +17,7 @@ from sparkos.agent.events import (
     ClarificationRequested,
     PlanCreated,
     PlanReplanned,
+    SkillActivated,
     StepCompleted,
     StepFailed,
     StepStarted,
@@ -26,11 +27,12 @@ from sparkos.agent.events import (
     TextDelta,
 )
 from sparkos.agent.runtime import AgentRuntime
-from sparkos.agent.skills.loader import load_skills, parse_slash_command
+from sparkos.agent.skills.loader import infer_skill_name, load_skills, parse_slash_command
 from sparkos.agent.task import AgentTask
 from sparkos.ui.file_browser_screen import FileBrowserScreen
 from sparkos.ui.history_screen import HistoryScreen
 from sparkos.ui.runtime_panel import RuntimePanel
+from sparkos.ui.skill_summary import SkillActivationSummary
 from sparkos.ui.tool_summary import ToolCallSummary
 
 
@@ -130,6 +132,23 @@ class ChatApp(App):
         margin: 0 0 1 2;
         background: $surface;
         border-left: outer $primary;
+    }
+
+    .skill-detail {
+        padding: 1 2;
+        color: $text-muted;
+    }
+
+    .skill-call {
+        margin: 0 0 1 2;
+        background: $surface;
+        border-left: outer $success;
+    }
+
+    .skill-summary {
+        margin: 0 0 1 2;
+        background: $surface;
+        border-left: outer $success;
     }
 
     #history-list Button {
@@ -281,6 +300,9 @@ class ChatApp(App):
         await chat.mount(assistant_message)
 
         skill_name, prompt_text = parse_slash_command(prompt, self.runtime.skills)
+        if skill_name is None:
+            skill_name = infer_skill_name(prompt_text, self.runtime.skills)
+        skill_summary: SkillActivationSummary | None = None
 
         task = AgentTask(goal=prompt_text or prompt)
         self.query_one("#runtime-panel", RuntimePanel).begin_task(task)
@@ -288,6 +310,7 @@ class ChatApp(App):
         self._generation_worker = self.generate_answer(
             task=task,
             skill_name=skill_name,
+            skill_summary=skill_summary,
             output=assistant_message,
         )
 
@@ -299,6 +322,7 @@ class ChatApp(App):
         task: AgentTask,
         skill_name: str | None,
         output: Markdown,
+        skill_summary: SkillActivationSummary | None = None,
     ) -> None:
         generation_worker = get_current_worker()
         prompt_input = self.query_one("#prompt", Input)
@@ -311,6 +335,7 @@ class ChatApp(App):
 
         markdown_stream = Markdown.get_stream(output)
         received_text = False
+        displayed_skills: set[tuple[str, str | None]] = set()
         tool_summary: ToolCallSummary | None = None
 
         try:
@@ -326,6 +351,19 @@ class ChatApp(App):
                     received_text = True
                     await markdown_stream.write(event.question)
                     status.update("等待补充")
+                elif isinstance(event, SkillActivated):
+                    if skill_summary is None:
+                        skill_summary = SkillActivationSummary()
+                        await chat.mount(skill_summary)
+                    key = (event.skill.name, event.step.id if event.step else None)
+                    if key not in displayed_skills:
+                        await skill_summary.add_skill(
+                            event.skill,
+                            step_id=event.step.id if event.step else None,
+                            source=event.source,
+                        )
+                        displayed_skills.add(key)
+                    status.update(f"已激活技能: {event.skill.name}")
                 elif isinstance(event, StepToolCompleted):
                     if tool_summary is None:
                         tool_summary = ToolCallSummary()
@@ -362,6 +400,8 @@ class ChatApp(App):
             raise
 
         finally:
+            if skill_summary is not None:
+                skill_summary.complete()
             if tool_summary is not None:
                 tool_summary.complete()
             await markdown_stream.stop()

@@ -32,3 +32,4 @@ sparkmind.egg-info/
 artifacts/
 data/
 .codegraph/
+.pytest_cache/

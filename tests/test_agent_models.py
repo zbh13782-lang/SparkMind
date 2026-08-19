@@ -93,12 +93,14 @@ class PlanningModelTests(unittest.TestCase):
             id="s1",
             description="read input",
             depends_on=(),
+            skills=("data-catalog",),
             success_criteria="input is available",
         )
         plan = Plan(task_id="task-1", steps=(step,), version=2)
 
         self.assertEqual(plan.version, 2)
         self.assertEqual(plan.steps[0].success_criteria, "input is available")
+        self.assertEqual(plan.steps[0].skills, ("data-catalog",))
         self.assertFalse(hasattr(step, "status"))
         with self.assertRaises(FrozenInstanceError):
             step.description = "changed"  # type: ignore[misc]

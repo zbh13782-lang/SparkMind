@@ -17,11 +17,13 @@ docker compose up -d spark-master spark-worker spark-history
 # 构建代码沙箱镜像（可选）
 docker build --pull -f docker/code-sandbox.Dockerfile -t sparkmind-code-sandbox:latest docker
 
-# 运行 Agent（自动跑 preflight 健康检查）
+# 运行 Agent（自动检查 LLM、Docker、Spark/Hive 和默认 Catalog）
 .venv/bin/python main.py
 ```
 
 预置服务：Spark Master UI <http://localhost:8080> / History UI <http://localhost:18080>。
+
+启动报告会强制刷新默认数据库的 Catalog：发现表时显示表数量；Spark/Hive 正常但数据库为空时以降级状态启动，便于先注册数据；Docker 不可用时会跳过 Spark/Hive 检查并保留其他交互能力。
 
 ## 配置
 
@@ -79,6 +81,15 @@ sparkos/
 | `run_code` | 无网络只读容器执行 Python / Bash，日志 `artifacts/code-runs/<run_id>/` |
 | `ask_advisor` | 调用高能力模型获取建议，每步限次数 |
 
+### 数据接入与问数
+
+- 已存在的 Hive 数据：直接提问，SparkMind 会先读取 Catalog，自动选择表和字段。
+- 新的 CSV、JSON/JSONL 或 Parquet：先 `inspect_data_source`，再 `register_dataset`，最后直接提问。
+- Hive Schema 在外部发生变化：调用 `get_data_catalog` 并设置 `refresh=true`。
+- 业务指标口径变化：编辑 `config/semantic_catalog.yaml`，技术字段仍以 Hive Metastore 为准。
+
+Catalog 快照位于 `artifacts/catalog/catalog.json`，不会通过全表扫描生成；注册后的文件会规范化为 Hive-managed Parquet 表。
+
 工具注册在 `sparkos/agent/tools/registry.py`：`TOOL_DEFINITIONS`（OpenAI function-calling schema）+ `execute_tool` 分发。新增工具时定义必须是裸 dict。
 
 ## 测试
@@ -93,7 +104,7 @@ sparkos/
 
 ## Spark 测试数据
 
-仓库提供可扩展的零售测试数据生成器，包含分区 CSV、嵌套 JSON、数据质量异常，以及装载后的持久 Hive 表：
+仓库提供可扩展的零售测试数据生成器，由脚本模拟实现，不上传真实隐私数据，包含分区 CSV、嵌套 JSON、数据质量异常，以及装载后的持久 Hive 表：
 
 ```bash
 .venv/bin/python scripts/generate_spark_test_data.py --preset small

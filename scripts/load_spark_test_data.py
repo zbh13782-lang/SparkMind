@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import json
+from datetime import datetime, timezone
+from pathlib import Path
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -107,10 +110,66 @@ def _csv(spark: SparkSession, path: str, schema: T.StructType):
     return spark.read.option("header", "true").schema(schema).csv(path)
 
 
+def _catalog_payload(spark: SparkSession) -> dict:
+    """Extract Hive metadata only; never scan table data while refreshing the cache."""
+    databases: list[dict] = []
+    for database in spark.catalog.listDatabases():
+        tables: list[dict] = []
+        for table in spark.catalog.listTables(database.name):
+            if table.isTemporary:
+                continue
+            qualified = f"`{database.name}`.`{table.name}`"
+            details = spark.sql(f"DESCRIBE TABLE EXTENDED {qualified}").collect()
+            detail_map = {
+                str(row.col_name).strip(): str(row.data_type).strip()
+                for row in details
+                if row.col_name and str(row.col_name).strip()
+            }
+            columns = [
+                {
+                    "name": column.name,
+                    "data_type": column.dataType,
+                    "nullable": bool(column.nullable),
+                    "is_partition": bool(column.isPartition),
+                    "description": column.description or "",
+                }
+                for column in spark.catalog.listColumns(table.name, database.name)
+            ]
+            tables.append(
+                {
+                    "database": database.name,
+                    "name": table.name,
+                    "table_type": table.tableType or "",
+                    "provider": detail_map.get("Provider", ""),
+                    "location": detail_map.get("Location", ""),
+                    "columns": columns,
+                    "description": getattr(table, "description", None) or "",
+                }
+            )
+        tables.sort(key=lambda item: item["name"])
+        databases.append({"name": database.name, "tables": tables})
+    databases.sort(key=lambda item: item["name"])
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),  # noqa: UP017 - Spark uses Python 3.8.
+        "databases": databases,
+        "warnings": [],
+    }
+
+
+def _refresh_catalog(spark: SparkSession, catalog_path: str) -> Path:
+    path = Path(catalog_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(_catalog_payload(spark), ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+    return path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="/opt/sparkos/data/sparkmind_retail")
     parser.add_argument("--database", default="sparkmind_demo")
+    parser.add_argument("--catalog-path", default="/opt/sparkos/artifacts/catalog/catalog.json")
     args = parser.parse_args()
 
     spark = SparkSession.builder.appName("sparkmind-load-demo-data").enableHiveSupport().getOrCreate()
@@ -147,6 +206,10 @@ def main() -> None:
     for table in outputs:
         count = spark.table(f"`{args.database}`.`{table}`").count()
         print(f"{args.database}.{table}: {count}")
+    catalog_path = _refresh_catalog(spark, args.catalog_path)
+    print(f"catalog refreshed: {catalog_path}")
+    print(f"default database: {args.database}")
+    print(f"tables: {len(outputs)}")
     spark.stop()
 
 

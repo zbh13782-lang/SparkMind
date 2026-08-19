@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
-from sparkos.infrastructure.advisor.models import AdvisorRequest, AdvisorResult
+from sparkos.infrastructure.advisor.models import AdvisorRequest
 from sparkos.infrastructure.advisor.service import AdvisorService
 
 
@@ -60,7 +60,7 @@ class AdvisorServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_returns_timed_out(self) -> None:
         fake_client = AsyncMock()
-        fake_client.chat_once.side_effect = asyncio.TimeoutError()
+        fake_client.chat_once.side_effect = TimeoutError()
         service = AdvisorService.__new__(AdvisorService)
         service.config = self._make_service(timeout=1).config
         service.client = fake_client

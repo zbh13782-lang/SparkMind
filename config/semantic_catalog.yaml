@@ -1,0 +1,43 @@
+version: 1
+default_database: sparkmind_demo
+
+tables:
+  sparkmind_demo.dim_customer:
+    description: 客户维表，一行一个客户
+  sparkmind_demo.dim_product:
+    description: 商品维表，一行一个商品
+  sparkmind_demo.fact_order:
+    description: 订单事实表，一行一个订单版本
+    time_column: order_ts
+    partition_column: dt
+  sparkmind_demo.fact_order_item:
+    description: 订单商品项事实表
+    partition_column: dt
+  sparkmind_demo.fact_event:
+    description: 用户行为事件表，包含嵌套设备和页面字段
+    time_column: event_time
+    partition_column: dt
+
+joins:
+  - left: sparkmind_demo.fact_order.customer_id
+    right: sparkmind_demo.dim_customer.customer_id
+    relationship: many_to_one
+  - left: sparkmind_demo.fact_order_item.product_id
+    right: sparkmind_demo.dim_product.product_id
+    relationship: many_to_one
+
+metrics:
+  gmv:
+    description: 有效订单成交金额
+    table: sparkmind_demo.fact_order
+    expression: SUM(total_amount)
+    filters:
+      - status IN ('paid', 'shipped', 'completed')
+      - total_amount >= 0
+  order_count:
+    description: 去重后的有效订单数量
+    table: sparkmind_demo.fact_order
+    expression: COUNT(DISTINCT order_id)
+    filters:
+      - status IN ('paid', 'shipped', 'completed')
+      - total_amount >= 0

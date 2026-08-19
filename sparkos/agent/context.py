@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,7 @@ _SYSTEM_PROMPT_PATH = Path(__file__).resolve().parent / "system_prompt.md"
 # 最多可见短期窗口数，默认值来自 config.yaml runtime.context_window
 try:
     WINDOW = get_runtime_config().context_window
-except Exception:
+except (OSError, KeyError, TypeError, ValueError):
     WINDOW = 12
 
 _COMPACT_PROMPT = (
@@ -51,6 +52,10 @@ class AgentContext:
         skills: list[Skill],
         tools: list[dict[str, Any]],
         skill_name: str | None = None,
+        skill_names: tuple[str, ...] | None = None,
+        catalog_summary: Mapping[str, Any] | None = None,
+        history_start: int | None = None,
+        max_history_chars: int = 12_000,
     ) -> list[ChatMessage]:
         """Build model context without silently dropping uncompressed history."""
         messages: list[ChatMessage] = []
@@ -63,19 +68,26 @@ class AgentContext:
         if skills_prompt:
             messages.append(ChatMessage(role="system", content=skills_prompt))
 
-        if skill_name:
-            skill_content = load_skill_content(skill_name)
+        active_names = skill_names
+        if active_names is None and skill_name:
+            active_names = (skill_name,)
+        for active_name in active_names or ():
+            skill_content = load_skill_content(active_name)
             if skill_content:
                 messages.append(
                     ChatMessage(
                         role="system",
-                        content=f"当前激活技能：{skill_name}\n\n{skill_content}",
+                        content=f"当前步骤激活技能：{active_name}\n\n{skill_content}",
                     )
                 )
 
         tools_prompt = self._tools_overview(tools)
         if tools_prompt:
             messages.append(ChatMessage(role="system", content=tools_prompt))
+
+        catalog_prompt = self._catalog_overview(catalog_summary or {})
+        if catalog_prompt:
+            messages.append(ChatMessage(role="system", content=catalog_prompt))
 
         if self.summary:
             messages.append(
@@ -85,8 +97,37 @@ class AgentContext:
                 )
             )
 
-        messages.extend(self.history[self.summary_upto :])
+        start = self.summary_upto if history_start is None else max(history_start, self.summary_upto)
+        history = self.history[start:]
+        messages.extend(self._bound_history(history, max_history_chars))
         return messages
+
+    @staticmethod
+    def _bound_history(history: list[ChatMessage], max_chars: int) -> list[ChatMessage]:
+        if max_chars <= 0:
+            return []
+        total = sum(len(message.content or "") for message in history)
+        if total <= max_chars:
+            return list(history)
+
+        remaining = max_chars
+        bounded: list[ChatMessage] = []
+        for message in reversed(history):
+            content = message.content or ""
+            if len(content) > remaining:
+                content = "[历史工具结果已截断，仅保留最近上下文片段]\n" + content[-max(0, remaining - 28) :]
+            bounded.append(
+                ChatMessage(
+                    role=message.role,
+                    content=content,
+                    tool_calls=message.tool_calls,
+                    tool_call_id=message.tool_call_id,
+                )
+            )
+            remaining -= len(content)
+            if remaining <= 0:
+                break
+        return list(reversed(bounded))
 
     @staticmethod
     def _tools_overview(tools: list[dict[str, Any]]) -> str:
@@ -97,6 +138,16 @@ class AgentContext:
             function = tool.get("function", {})
             lines.append(f"- {function.get('name', '')}: {function.get('description', '')}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _catalog_overview(summary: Mapping[str, Any]) -> str:
+        database = str(summary.get("default_database", "")).strip()
+        tables = summary.get("tables", [])
+        if not database or not isinstance(tables, list):
+            return ""
+        names = ", ".join(str(item) for item in tables[:50]) or "（暂无已缓存表）"
+        stale = "；当前摘要可能过期，请先调用 get_data_catalog(refresh=true)" if summary.get("stale") else ""
+        return f"当前数据目录摘要：默认数据库 {database}；可用表 {names}{stale}。字段和分区请通过 get_data_catalog 按需获取。"
 
     def record_user(self, text: str) -> None:
         self.history.append(ChatMessage(role="user", content=text))

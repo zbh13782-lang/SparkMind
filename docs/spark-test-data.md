@@ -67,6 +67,10 @@ docker compose --profile jobs run --rm -T spark-client \
   /opt/sparkos/scripts/load_spark_test_data.py
 ```
 
+装载脚本完成五张表后会自动刷新 `artifacts/catalog/catalog.json`。因此后续问数无需先提供表结构：先查 Catalog，再按需读取目标表字段。外部新增或修改 Hive 表后，可使用 `get_data_catalog(refresh=true)` 强制刷新。
+
+对于额外文件，流程是：`inspect_data_source` 检查格式和样例 → `register_dataset` 注册为 Hive-managed Parquet → 再通过 Catalog 查询并问数。默认不覆盖已有表。
+
 数据生成在 `data/sparkmind_retail/`，Hive warehouse 和 Derby metastore 在 `data/hive/`。这两个目录已由 `.gitignore` 排除。相同参数与 seed 会得到相同内容；重新生成会先替换整个输出目录。
 
 验证表和分区：

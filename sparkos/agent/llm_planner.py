@@ -26,6 +26,7 @@ _PLANNER_PROMPT_TEMPLATE = """你是 Agent 的任务规划器。你的职责仅�
       "id": "s1",
       "description": "明确、可执行的动作",
       "depends_on": [],
+      "skills": [],
       "success_criteria": "可验证的完成条件"
     }
   ]
@@ -35,9 +36,15 @@ _PLANNER_PROMPT_TEMPLATE = """你是 Agent 的任务规划器。你的职责仅�
 - 如果缺少完成任务所必需、且无法从上下文推断的用户信息，返回 {"should_plan": false, "clarification_question": "一个简洁、具体的问题", "steps": []}。
 - 不要追问可选偏好或能合理默认的信息；简单问答、单次工具调用或一步即可完成的任务，返回 {"should_plan": false, "clarification_question": null, "steps": []}。
 - 需要规划时 clarification_question 必须为 null。
+- 数据问答缺少表名时，先检查 catalog_summary；摘要为空或字段不足且 get_data_catalog 可用时，规划 Catalog 发现步骤，不要先要求用户提供表结构。
+- Catalog 存在唯一合理匹配时使用该表；存在多个业务含义不同的匹配时才询问用户选择。
+- Catalog 中没有表，且用户也没有给文件路径或数据源时，才询问数据来源。
+- 指标名称存在歧义且 Catalog 语义层没有定义时，询问指标口径，不猜测业务定义。
 - 只有确实需要多个相互依赖动作时才规划。
 - 最多 {max_steps} 步；每步只描述一个动作。
 - 每步必须给出明确、可验证的 success_criteria。
+- 每步使用 skills 列出该步骤需要动态加载的技能；不需要技能时返回空数组。只能使用输入 skills 中存在的 name。
+- 查询、目录发现、SQL、Spark 执行、质量检测等不同动作应按步骤选择对应技能，不要把所有技能分配给每一步。
 - id 在当前计划中唯一；depends_on 只能引用当前计划中的步骤 id。
 - 计划必须是无环图，避免重复、空泛或无法验证的步骤。
 - 技能和工具只是可用能力，不要编造未列出的能力。"""
@@ -52,6 +59,7 @@ _REPLAN_PROMPT_TEMPLATE = """你是 Agent 的重规划器。当前 Plan 中的�
       "id": "s1",
       "description": "明确、可执行的动作",
       "depends_on": [],
+      "skills": [],
       "success_criteria": "可验证的完成条件"
     }
   ]
@@ -60,6 +68,7 @@ _REPLAN_PROMPT_TEMPLATE = """你是 Agent 的重规划器。当前 Plan 中的�
 规则：
 - 返回完整 Plan，最多 {max_steps} 步，必须是无环图。
 - 已成功步骤如仍需要，必须原样保留 id、description、depends_on 和 success_criteria，以便复用结果。
+- 已成功步骤如仍需要，也必须原样保留 skills；新步骤只能选择输入 skills 中存在的 name。
 - 替换失败步骤时使用新 id，修正后续依赖。
 - 针对 failure_reason 更换方法、数据源或拆分方式，不要简单重复失败动作。
 - 技能和工具只是可用能力，不要编造未列出的能力。"""
@@ -92,7 +101,7 @@ class LLMPlanner(Planner):
             request = self._build_request(task, context)
             response = await self.model.chat_once(request, json_object=True)
             payload = self._parse_payload(response)
-            return self._build_initial_decision(task, payload)
+            return self._build_initial_decision(task, payload, context.skill_names)
         except Exception:  # noqa: BLE001
             # Planning is an optional optimization. Invalid output or a planning
             # model failure must not prevent Runtime from executing the task.
@@ -121,6 +130,7 @@ class LLMPlanner(Planner):
             return self._build_plan(
                 task,
                 payload,
+                available_skills=context.skill_names,
                 version=current_plan.version + 1,
                 source="replan",
             )
@@ -145,6 +155,7 @@ class LLMPlanner(Planner):
                 for skill in context.skills
             ],
             "tools": list(context.tool_names),
+            "catalog_summary": dict(context.catalog_summary),
         }
         return [
             {
@@ -173,6 +184,7 @@ class LLMPlanner(Planner):
             "recent_messages": [message.to_api_dict() for message in context.recent_messages],
             "skills": [{"name": skill.name, "description": skill.description} for skill in context.skills],
             "tools": list(context.tool_names),
+            "catalog_summary": dict(context.catalog_summary),
             "current_plan": self._serialize_plan(current_plan),
             "step_runs": {step_id: self._serialize_run(run) for step_id, run in step_runs.items()},
             "failed_step": self._serialize_step(failed_step),
@@ -211,6 +223,7 @@ class LLMPlanner(Planner):
         task: AgentTask,
         payload: dict[str, Any],
         *,
+        available_skills: tuple[str, ...],
         version: int = 1,
         source: str = "planner",
     ) -> Plan | None:
@@ -235,6 +248,7 @@ class LLMPlanner(Planner):
             step_id = raw_step.get("id")
             description = raw_step.get("description")
             depends_on = raw_step.get("depends_on", [])
+            raw_skills = raw_step.get("skills", [])
             success_criteria = raw_step.get("success_criteria")
             if not isinstance(step_id, str) or not step_id.strip():
                 raise ValueError("步骤 id 不能为空")
@@ -247,10 +261,20 @@ class LLMPlanner(Planner):
                 isinstance(dependency, str) and dependency.strip() for dependency in depends_on
             ):
                 raise ValueError(f"步骤 {step_id} 的 depends_on 无效")
+            if not isinstance(raw_skills, list) or not all(
+                isinstance(skill, str) and skill.strip() for skill in raw_skills
+            ):
+                raise ValueError(f"步骤 {step_id} 的 skills 无效")
+            unknown_skills = {
+                skill.strip() for skill in raw_skills if skill.strip() not in available_skills
+            }
+            if unknown_skills:
+                raise ValueError(f"步骤 {step_id} 引用了未知技能：{', '.join(sorted(unknown_skills))}")
             if success_criteria is not None and (not isinstance(success_criteria, str) or not success_criteria.strip()):
                 raise ValueError(f"步骤 {step_id} 的 success_criteria 无效")
 
             normalized_dependencies = tuple(dependency.strip() for dependency in depends_on)
+            normalized_skills = tuple(dict.fromkeys(skill.strip() for skill in raw_skills))
             normalized_criteria = (
                 success_criteria.strip() if success_criteria is not None else f"完成步骤：{description.strip()}"
             )
@@ -259,6 +283,7 @@ class LLMPlanner(Planner):
                     id=step_id,
                     description=description.strip(),
                     depends_on=normalized_dependencies,
+                    skills=normalized_skills,
                     success_criteria=normalized_criteria,
                 )
             )
@@ -276,6 +301,7 @@ class LLMPlanner(Planner):
         self,
         task: AgentTask,
         payload: dict[str, Any],
+        available_skills: tuple[str, ...],
     ) -> Plan | ClarificationRequest | None:
         should_plan = payload.get("should_plan")
         if not isinstance(should_plan, bool):
@@ -291,7 +317,7 @@ class LLMPlanner(Planner):
 
         if clarification is not None:
             raise ValueError("需要规划时 clarification_question 必须为 null")
-        return self._build_plan(task, payload)
+        return self._build_plan(task, payload, available_skills=available_skills)
 
     @staticmethod
     def _serialize_step(step: PlanStep) -> dict[str, Any]:
@@ -299,6 +325,7 @@ class LLMPlanner(Planner):
             "id": step.id,
             "description": step.description,
             "depends_on": list(step.depends_on),
+            "skills": list(step.skills),
             "success_criteria": step.success_criteria,
         }
 

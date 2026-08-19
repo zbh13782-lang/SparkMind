@@ -42,6 +42,7 @@ class JsonTaskStoreTests(unittest.TestCase):
                     id="s1",
                     description="read data",
                     depends_on=(),
+                    skills=("data-catalog", "spark-sql"),
                     success_criteria="data loaded",
                 ),
             ),
@@ -77,6 +78,10 @@ class JsonTaskStoreTests(unittest.TestCase):
             self.assertEqual(
                 payload["plan"]["steps"][0]["success_criteria"],
                 "data loaded",
+            )
+            self.assertEqual(
+                payload["plan"]["steps"][0]["skills"],
+                ["data-catalog", "spark-sql"],
             )
             self.assertEqual(
                 payload["step_runs"]["s1"]["result"]["output"],
