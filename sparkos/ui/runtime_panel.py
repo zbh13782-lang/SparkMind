@@ -48,13 +48,13 @@ _TASK_LABELS = {
 
 _TASK_COLORS = {
     "idle": "dim",
-    "pending": "yellow",
+    "pending": "magenta",
     "planning": "cyan",
     "running": "cyan",
-    "waiting_input": "yellow",
+    "waiting_input": "magenta",
     "succeeded": "green",
     "failed": "red",
-    "cancelled": "yellow",
+    "cancelled": "dim",
 }
 
 _STEP_MARKS = {
@@ -63,7 +63,7 @@ _STEP_MARKS = {
     "tooling": ("◆", "magenta"),
     "succeeded": ("✓", "green"),
     "failed": ("×", "red"),
-    "cancelled": ("■", "yellow"),
+    "cancelled": ("■", "dim"),
 }
 
 

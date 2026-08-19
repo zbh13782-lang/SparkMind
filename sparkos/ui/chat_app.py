@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import traceback
 from asyncio import sleep as async_sleep
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any, ClassVar
 
 from rich.text import Text
@@ -11,7 +14,7 @@ from textual import events, work
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Footer, Header, Input, Markdown, Static
-from textual.worker import get_current_worker
+from textual.worker import Worker, get_current_worker
 
 from sparkos.agent.events import (
     ClarificationRequested,
@@ -29,188 +32,143 @@ from sparkos.agent.events import (
 from sparkos.agent.runtime import AgentRuntime
 from sparkos.agent.skills.loader import infer_skill_name, load_skills, parse_slash_command
 from sparkos.agent.task import AgentTask
+from sparkos.startup.preflight import PreflightResult, ProgressCallback, run_preflight
 from sparkos.ui.file_browser_screen import FileBrowserScreen
 from sparkos.ui.history_screen import HistoryScreen
 from sparkos.ui.runtime_panel import RuntimePanel
 from sparkos.ui.skill_summary import SkillActivationSummary
+from sparkos.ui.startup_panel import StartupPanel
 from sparkos.ui.tool_summary import ToolCallSummary
+from sparkos.ui.welcome_panel import WelcomePanel
+
+RuntimeFactory = Callable[[], AgentRuntime]
+PreflightRunner = Callable[[ProgressCallback | None], Awaitable[PreflightResult]]
 
 
 class ChatApp(App):
     TITLE = "SparkMind"
     SUB_TITLE = "Agent Runtime"
 
-    CSS = """
-    Screen {
-        layout: vertical;
-        background: $background;
-    }
-
-    #workspace {
-        height: 1fr;
-        width: 1fr;
-    }
-
-    #conversation-pane {
-        height: 1fr;
-        width: 1fr;
-    }
-
-    #chat {
-        height: 1fr;
-        padding: 1 2;
-    }
-
-    .user-message {
-        margin: 1 0;
-        padding: 1 2;
-        background: $primary 20%;
-        border-left: thick $primary;
-    }
-
-    .assistant-message {
-        margin: 1 0;
-        padding: 1 2;
-        background: $surface;
-        border-left: thick $success;
-    }
-
-    #runtime-sidebar {
-        width: 42;
-        min-width: 32;
-        height: 1fr;
-        padding: 1 2;
-        background: $surface;
-        border-left: solid $primary;
-    }
-
-    #runtime-panel {
-        width: 1fr;
-        height: auto;
-    }
-
-    #workspace.compact {
-        layout: vertical;
-    }
-
-    #workspace.compact #conversation-pane {
-        width: 1fr;
-        height: 1fr;
-    }
-
-    #workspace.compact #runtime-sidebar {
-        width: 1fr;
-        min-width: 1;
-        height: 13;
-        padding: 1 2;
-        border-left: none;
-        border-top: solid $primary;
-    }
-
-    #prompt {
-        margin: 0 1;
-    }
-
-    .slash-hint {
-        height: auto;
-        padding: 1 2;
-        color: $text-muted;
-    }
-
-    .tool-detail {
-        padding: 1 2;
-        color: $text-muted;
-    }
-
-    .tool-call {
-        margin: 0 0 1 2;
-        background: $surface;
-        border-left: outer $accent;
-    }
-
-    .tool-summary {
-        margin: 0 0 1 2;
-        background: $surface;
-        border-left: outer $primary;
-    }
-
-    .skill-detail {
-        padding: 1 2;
-        color: $text-muted;
-    }
-
-    .skill-call {
-        margin: 0 0 1 2;
-        background: $surface;
-        border-left: outer $success;
-    }
-
-    .skill-summary {
-        margin: 0 0 1 2;
-        background: $surface;
-        border-left: outer $success;
-    }
-
-    #history-list Button {
-        width: 1fr;
-        border: none;
-    }
-
-    #history-list Button.-active {
-        background: $primary 30%;
-    }
-
-    #history-list Button:hover {
-        background: $primary 20%;
-    }
-
-    #status {
-        height: 1;
-        padding: 0 2;
-        color: $text-muted;
-        background: $surface;
-    }
-    """
+    CSS_PATH = str(Path(__file__).with_name("chat_app.tcss"))
 
     BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
         ("ctrl+c", "quit", "退出"),
         ("escape", "cancel_generation", "停止生成"),
     ]
 
-    def __init__(self, tools: list[dict[str, Any]] | None = None) -> None:
+    def __init__(
+        self,
+        tools: list[dict[str, Any]] | None = None,
+        *,
+        runtime: AgentRuntime | None = None,
+        runtime_factory: RuntimeFactory | None = None,
+        preflight_runner: PreflightRunner | None = None,
+    ) -> None:
         super().__init__()
-        self.runtime = AgentRuntime(
-            enable_planning=True,
-            tools=tools,
+        self._runtime = runtime
+        self._runtime_factory = runtime_factory or (
+            lambda: AgentRuntime(
+                enable_planning=True,
+                tools=tools,
+            )
         )
-        self._generation_worker: object | None = None
+        self._preflight_runner = preflight_runner or run_preflight
+        self._uses_default_preflight = preflight_runner is None
+        self._startup_worker: Worker[None] | None = None
+        self._generation_worker: Worker[None] | None = None
+
+    @property
+    def runtime(self) -> AgentRuntime:
+        """Return the runtime, constructing it lazily for compatibility callers."""
+        if self._runtime is None:
+            self._runtime = self._runtime_factory()
+        return self._runtime
+
+    @runtime.setter
+    def runtime(self, value: AgentRuntime) -> None:
+        self._runtime = value
 
     def compose(self) -> ComposeResult:
         yield Header()
 
+        yield StartupPanel(id="startup")
+
         with Horizontal(id="workspace"):
-            with Vertical(id="conversation-pane"), VerticalScroll(id="chat"):
-                pass
+            with Vertical(id="conversation-pane"):
+                yield Static("对话", classes="section-label")
+                with VerticalScroll(id="chat"):
+                    self._welcome = WelcomePanel(id="welcome")
+                    yield self._welcome
             with VerticalScroll(id="runtime-sidebar"):
+                yield Static("运行监控", classes="section-label")
                 yield RuntimePanel(id="runtime-panel")
 
-        yield Static("就绪", id="status", markup=False)
-        yield Input(
-            placeholder="今天想聊点什么……(输入/ 以显示指令)",
-            id="prompt",
-        )
-        self._slash_hint = Static(
-            "",
-            id="slash-hint",
-            classes="slash-hint",
-            markup=False,
-        )
-        yield self._slash_hint
+        with Vertical(id="composer"):
+            yield Static("就绪", id="status", markup=False)
+            yield Input(
+                placeholder="今天想聊什么……(输入 / 以显示指令)",
+                id="prompt",
+            )
+            self._slash_hint = Static(
+                "",
+                id="slash-hint",
+                classes="slash-hint",
+                markup=False,
+            )
+            yield self._slash_hint
+
         yield Footer()
 
     async def on_mount(self) -> None:
         self._apply_responsive_layout(self.size.width)
-        self.query_one("#prompt", Input).focus()
+        if self._runtime is not None:
+            self._finish_startup()
+        elif self.is_headless and self._uses_default_preflight:
+            # Existing component tests should not perform network/Docker checks.
+            # Keep construction in a Textual worker so the constructor remains lazy.
+            self._startup_worker = self.initialize_runtime(run_preflight_checks=False)
+        else:
+            self._startup_worker = self.initialize_runtime()
+
+    def _finish_startup(self) -> None:
+        self.query_one("#startup", StartupPanel).display = False
+        self.query_one("#workspace", Horizontal).display = True
+        self.query_one("#composer", Vertical).display = True
+        prompt = self.query_one("#prompt", Input)
+        prompt.disabled = False
+        prompt.focus()
+        self.query_one("#status", Static).update("就绪")
+
+    @work(exclusive=True, group="startup", exit_on_error=False)
+    async def initialize_runtime(self, *, run_preflight_checks: bool = True) -> None:
+        """Run health checks and runtime construction without blocking the first frame."""
+        startup = self.query_one("#startup", StartupPanel)
+        try:
+            if run_preflight_checks:
+                result = await self._preflight_runner(startup.set_stage)
+                if not result.passed:
+                    detail = next(
+                        (
+                            detail
+                            for name, ok, detail, _ in result.results
+                            if name == "LLM" and not ok
+                        ),
+                        "LLM 检查失败",
+                    )
+                    startup.fail(detail)
+                    self.exit(return_code=1, message=detail)
+                    return
+
+            if run_preflight_checks:
+                startup.set_stage("runtime", "正在加载 Agent Runtime")
+            self._runtime = await asyncio.to_thread(self._runtime_factory)
+            if run_preflight_checks:
+                startup.succeed("服务检查完成")
+            self._finish_startup()
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {exc}"
+            startup.fail(detail)
+            self.exit(return_code=1, message=detail)
 
     def on_resize(self, event: events.Resize) -> None:
         self._apply_responsive_layout(event.size.width)
@@ -220,6 +178,10 @@ class ChatApp(App):
         workspace.set_class(width < 100, "compact")
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if self._runtime is None:
+            self._slash_hint.update("")
+            return
+
         input_widget = event.input
         value = input_widget.value
 
@@ -263,6 +225,14 @@ class ChatApp(App):
         if not prompt:
             return
 
+        if self._runtime is None:
+            self.query_one("#status", Static).update("正在启动，请稍候…")
+            event.input.value = ""
+            return
+
+        welcome_query = self.query("#welcome")
+        if len(welcome_query) > 0:
+            welcome_query.first(WelcomePanel).display = False
         event.input.value = ""
 
         if prompt == "/skills":
@@ -429,6 +399,8 @@ class ChatApp(App):
         self.runtime.context.clear()
         chat = self.query_one("#chat", VerticalScroll)
         await chat.remove_children()
+        self._welcome = WelcomePanel(id="welcome")
+        await chat.mount(self._welcome)
         self.query_one("#runtime-panel", RuntimePanel).reset()
         self.query_one("#status", Static).update("就绪")
         self._slash_hint.update("")

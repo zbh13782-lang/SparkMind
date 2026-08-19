@@ -123,3 +123,19 @@ class PreflightTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.results[2][1])
         self.assertTrue(result.results[2][3])
         spark_check.assert_not_awaited()
+
+
+class PreflightProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_preflight_reports_each_real_stage_in_order(self) -> None:
+        progress: list[tuple[str, str]] = []
+        with (
+            patch("config.health.check_llm", new=AsyncMock(return_value=CheckResult(True, "ok"))),
+            patch("config.health.check_docker", new=AsyncMock(return_value=CheckResult(True, "docker"))),
+            patch("config.health.check_spark_hive", new=AsyncMock(return_value=CheckResult(True, "spark"))),
+            patch("config.health._check_advisor_with_fallback", new=AsyncMock(return_value=CheckResult(True, "advisor"))),
+            patch("config.config.get_chat_config", return_value=object()),
+        ):
+            result = await run_preflight(lambda stage, detail: progress.append((stage, detail)))
+        self.assertTrue(result.passed)
+        self.assertEqual([stage for stage, _ in progress], ["llm", "docker", "spark-hive", "advisor"])
+        self.assertTrue(all(detail for _, detail in progress))

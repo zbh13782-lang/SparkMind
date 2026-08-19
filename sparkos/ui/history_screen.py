@@ -11,6 +11,7 @@ from textual.widgets import Button, Footer, Header, Markdown, Static
 
 from sparkos.agent.memory import list_sessions
 from sparkos.ui.runtime_panel import RuntimePanel
+from sparkos.ui.welcome_panel import WelcomePanel
 
 
 class HistoryScreen(Screen):
@@ -67,10 +68,12 @@ class HistoryScreen(Screen):
         app = self.app
         if app.runtime.context.load_session(session_id):
             chat = app.query_one("#chat", VerticalScroll)
-            await chat.remove_children()
+            await chat.remove_children([child for child in chat.children if child.id != "welcome"])
             app.query_one("#runtime-panel", RuntimePanel).reset()
             app.query_one("#status", Static).update("已加载历史会话")
             app._slash_hint.update("")
+            welcome = chat.query("#welcome").first(WelcomePanel)
+            has_messages = False
             for msg in app.runtime.context.history:
                 if msg.role == "user":
                     widget = Static(
@@ -82,6 +85,8 @@ class HistoryScreen(Screen):
                     widget = Markdown(msg.content, classes="assistant-message")
                 else:
                     continue
-                chat.mount(widget)
+                has_messages = True
+                await chat.mount(widget)
+            welcome.display = not has_messages
             chat.scroll_end(animate=False)
         self.dismiss()

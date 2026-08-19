@@ -334,7 +334,8 @@ class ChatAppLayoutTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNone(app._generation_worker)
             self.assertFalse(app.query_one("#prompt", Input).disabled)
-            self.assertEqual(len(app.query_one("#chat").children), 0)
+            self.assertEqual(len(app.query_one("#chat").query(".user-message")), 0)
+            self.assertEqual(len(app.query_one("#chat").query(".assistant-message")), 0)
 
 
 if __name__ == "__main__":

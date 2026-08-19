@@ -1,0 +1,210 @@
+Screen {
+    layout: vertical;
+    background: $background;
+    color: $text;
+}
+
+Header {
+    height: 3;
+    background: $surface;
+    color: $text;
+}
+
+#startup {
+    width: 1fr;
+    height: 1fr;
+    align: center middle;
+    content-align: center middle;
+    background: $background;
+}
+
+#startup-spinner {
+    width: 1fr;
+    height: 3;
+    color: #22d3ee;
+    content-align: center middle;
+}
+
+#startup-title,
+#startup-detail {
+    width: 1fr;
+    content-align: center middle;
+}
+
+#startup-title {
+    text-style: bold;
+    color: $text;
+}
+
+#startup-detail {
+    color: $text-muted;
+}
+
+#workspace {
+    display: none;
+    height: 1fr;
+    width: 1fr;
+    padding: 1 1 0 1;
+}
+
+#conversation-pane {
+    height: 1fr;
+    width: 1fr;
+    padding-right: 1;
+}
+
+#chat {
+    height: 1fr;
+    padding: 1 2;
+    scrollbar-size: 1 1;
+}
+
+#welcome {
+    width: 1fr;
+    min-height: 10;
+    margin: 3 4;
+    padding: 2 3;
+    border: round $primary 35%;
+    background: $surface;
+    content-align: center middle;
+}
+
+.user-message,
+.assistant-message {
+    width: 94%;
+    margin: 1 0;
+    padding: 1 2;
+    border: round $panel;
+}
+
+.user-message {
+    background: $primary 18%;
+    border-left: thick $primary;
+}
+
+.assistant-message {
+    background: $surface;
+    border-left: thick $success;
+}
+
+#runtime-sidebar {
+    width: 42;
+    min-width: 32;
+    height: 1fr;
+    padding: 1 2;
+    background: $surface;
+    border: round $panel;
+    border-left: solid $primary;
+}
+
+#runtime-panel {
+    width: 1fr;
+    height: auto;
+}
+
+.section-label {
+    height: 1;
+    margin-bottom: 1;
+    color: $text-muted;
+    text-style: bold;
+}
+
+#workspace.compact {
+    layout: vertical;
+}
+
+#workspace.compact #conversation-pane {
+    width: 1fr;
+    height: 1fr;
+    padding-right: 0;
+}
+
+#workspace.compact #runtime-sidebar {
+    width: 1fr;
+    min-width: 1;
+    height: 13;
+    padding: 1 2;
+    border-left: none;
+    border-top: solid $primary;
+}
+
+#composer {
+    display: none;
+    height: auto;
+    padding: 0 1 1 1;
+    background: $background;
+}
+
+#status {
+    height: 1;
+    padding: 0 2;
+    color: $text-muted;
+}
+
+#prompt {
+    height: 3;
+    margin: 0 1;
+    padding: 0 1;
+    border: round $panel;
+    background: $surface;
+}
+
+#prompt:focus {
+    border: round #22d3ee;
+}
+
+Button:focus {
+    border: round #22d3ee;
+}
+
+.slash-hint {
+    height: auto;
+    padding: 1 2 0 2;
+    color: $text-muted;
+}
+
+.tool-detail,
+.skill-detail {
+    padding: 1 2;
+    color: $text-muted;
+}
+
+.tool-call,
+.skill-call {
+    margin: 0 0 1 2;
+    background: $surface;
+}
+
+.tool-call {
+    border-left: outer #c084fc;
+}
+
+.skill-call {
+    border-left: outer $success;
+}
+
+.tool-summary,
+.skill-summary {
+    margin: 0 0 1 2;
+    background: $surface;
+}
+
+.tool-summary {
+    border-left: outer $primary;
+}
+
+.skill-summary {
+    border-left: outer $success;
+}
+
+#history-list Button,
+#file-list Button {
+    width: 1fr;
+    border: none;
+}
+
+#history-list Button.-active,
+#history-list Button:hover,
+#file-list Button:hover {
+    background: $primary 20%;
+}
